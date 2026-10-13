@@ -1,0 +1,67 @@
+name: Build Folia iOS IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 组装（下载 Folia 源码 + 构建 Web 包 + 注入桥接层 + 套壳）
+        run: python3 apply.py --out .
+
+      - name: Capacitor sync
+        working-directory: folia-build
+        run: npx cap sync ios
+
+      - name: 构建未签名 IPA
+        working-directory: folia-build/ios/App
+        run: |
+          set -e
+          xcodebuild archive \
+            -project App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -archivePath "$PWD/Folia.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ENTITLEMENTS_REQUIRED=NO
+          mkdir -p Payload
+          cp -R Folia.xcarchive/Products/Applications/*.app Payload/
+          zip -qry Folia.ipa Payload
+          ls -la Folia.ipa
+          shasum -a 256 Folia.ipa
+
+      - name: 发布 IPA 到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ios-v0.7.18-${{ github.run_number }}
+          name: "Folia iOS 独立版 (TrollStore IPA) #${{ github.run_number }}"
+          body: |
+            Folia iOS 独立版 —— 上游 0.7.18 + 应用内桥接层，**不需要电脑/服务器**。
+
+            - 全屏沉浸歌词、粒子可视化、多主题（上游完整界面）
+            - 网易云搜索/播放/歌词（QQ、酷狗后续接入）
+            - 移动端优化：性能档位（省电 / 均衡 / 极致，左上角 ⚡ 切换）；好设备自动拉满
+            - 后台播放（已开启 background audio）
+
+            未签名构建（CODE_SIGNING_ALLOWED=NO），TrollStore 直装或侧载。
+          files: folia-build/ios/App/Folia.ipa
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Folia iOS 独立版 · 自组装脚本（在 CI 或本地运行）
+
+流程：
+  1. 下载 Folia 上游源码（codeload）
+  2. 修依赖（去掉后端/原生模块）+ npm install
+  3. 以相对地址构建 Web 包（vite build，API 指向应用内桥接层）
+  4. 注入桥接层（mr-standalone.js + folia-bridge.js + qrcode.js），关闭 Service Worker
+  5. 下载 iOS 工程骨架（Capacitor）并打补丁（Info.plist / pbxproj / 原生插件）
+  6. 补丁 capacitor.config.json（webDir=dist）
+
+用法:
+  python3 apply.py --out . [--skip-build] [--src-folia DIR] [--src-ios DIR]
+"""
+import argparse
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import zipfile
+
+FOLIA_ZIP = "https://codeload.github.com/chthollyphile/folia-major/zip/refs/heads/main"
+IOS_ZIP = "https://codeload.github.com/xxyyht-design/Mineradio-v2-iOS-Standalone/zip/refs/heads/main"
+QRCODE_URL = "https://unpkg.com/qrcode-generator@1.4.4/qrcode.js"
+
+# 后端/原生专用依赖（Web 构建不需要，且其中两个在真机/CI 上装不动）
+DROP_DEPS = [
+    "kugoumusicapi",          # github 直链，CI 拉取会被墙
+    "koffi",                  # 原生 FFI，需要 CMake 重新编译
+    "onnxruntime-node",       # 原生推理库（AI 功能用）
+    "electron-store",
+    "electron-updater",
+    "@xhayper/discord-rpc",
+]
+CAPACITOR_DEPS = {
+    "@capacitor/cli": "8.4.2",
+    "@capacitor/core": "8.4.2",
+    "@capacitor/ios": "8.4.2",
+}
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PATCH_DIR = os.path.join(SCRIPT_DIR, "patch")
+
+FAILS = []
+
+
+def log(msg):
+    print("[folia-apply] " + str(msg), flush=True)
+
+
+def die(msg):
+    print("[folia-apply][FATAL] " + str(msg), flush=True)
+    sys.exit(1)
+
+
+def must(cond, msg):
+    if not cond:
+        FAILS.append(msg)
+        log("!! 校验失败: " + msg)
+
+
+def download(url, dest):
+    log("下载 " + url)
+    for attempt in range(3):
+        try:
+            subprocess.run(["curl", "-sL", "--fail", "--retry", "2", "-o", dest, url], check=True)
+            if os.path.getsize(dest) > 1000:
+                return dest
+        except Exception as e:
+            log("第 %d 次失败: %s" % (attempt + 1, e))
+    die("下载失败: " + url)
+
+
+def unzip_first_dir(zip_path, out_dir):
+    with zipfile.ZipFile(zip_path) as z:
+        z.extractall(out_dir)
+    entries = [e for e in os.listdir(out_dir) if os.path.isdir(os.path.join(out_dir, e))]
+    if not entries:
+        die("解压目录为空: " + zip_path)
+    return os.path.join(out_dir, sorted(entries)[0])
+
+
+def read(path):
+    with io.open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with io.open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def run(cmd, cwd=None, env=None, label=""):
+    log("$ " + (label or " ".join(cmd[:3]) + " …"))
+    e = dict(os.environ)
+    e["ELECTRON_SKIP_BINARY_DOWNLOAD"] = "1"
+    if env:
+        e.update(env)
+    r = subprocess.run(cmd, cwd=cwd, env=e)
+    if r.returncode != 0:
+        die("命令失败(%d): %s" % (r.returncode, " ".join(cmd[:4])))
+
+
+def patch_json_deps(pkg_path, drop, add):
+    d = json.loads(read(pkg_path))
+    removed = []
+    for k in drop:
+        if k in d.get("dependencies", {}):
+            d["dependencies"].pop(k)
+            removed.append(k)
+    if add:
+        d.setdefault("dependencies", {}).update(add)
+    d["dependencies"] = dict(sorted(d["dependencies"].items()))
+    write(pkg_path, json.dumps(d, ensure_ascii=False, indent=2))
+    log("依赖调整: 移除 %s；加入 %s" % (removed, list((add or {}).keys())))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--src-folia", help="本地 Folia 源码目录（不给则下载）")
+    ap.add_argument("--src-ios", help="本地 iOS 骨架根目录（不给则下载）")
+    ap.add_argument("--qrcode", help="本地 qrcode.js")
+    ap.add_argument("--skip-build", action="store_true", help="复用已有 dist（本地调试用）")
+    args = ap.parse_args()
+
+    out = os.path.abspath(args.out)
+    tmp = os.path.join(out, ".build-src")
+    os.makedirs(tmp, exist_ok=True)
+
+    # ---------- 1. Folia 源码（固定落到 <out>/folia-build） ----------
+    work_dir = os.path.join(out, "folia-build")
+    if args.src_folia:
+        folia = os.path.abspath(args.src_folia)
+        if not os.path.isfile(os.path.join(folia, "package.json")):
+            die("不是 Folia 源码目录: " + folia)
+        log("Folia 源码（本地）: " + folia)
+    else:
+        if os.path.isdir(work_dir):
+            log("清理旧的 folia-build")
+            shutil.rmtree(work_dir, ignore_errors=True)
+        zp = download(FOLIA_ZIP, os.path.join(tmp, "folia.zip"))
+        inner = unzip_first_dir(zp, os.path.join(tmp, "folia"))
+        os.makedirs(work_dir, exist_ok=True)
+        for name in os.listdir(inner):
+            shutil.move(os.path.join(inner, name), os.path.join(work_dir, name))
+        folia = work_dir
+        log("Folia 源码: " + folia)
+
+    # ---------- 2. 依赖 ----------
+    patch_json_deps(os.path.join(folia, "package.json"), DROP_DEPS, CAPACITOR_DEPS)
+    if not args.skip_build:
+        node_modules = os.path.join(folia, "node_modules")
+        if os.path.isdir(node_modules):
+            shutil.rmtree(node_modules, ignore_errors=True)
+        run(["npm", "install", "--no-audit", "--no-fund", "--legacy-peer-deps",
+             "--ignore-scripts"], cwd=folia, label="npm install")
+
+    # ---------- 3. 构建 Web 包（API 指向应用内桥接层） ----------
+    if not args.skip_build:
+        run(["npx", "vite", "build"], cwd=folia, label="vite build", env={
+            "VITE_NETEASE_API_BASE": "/neapi",
+            "VITE_KUGOU_API_BASE": "/kgapi",
+            "VITE_QQ_API_BASE": "/qqapi",
+        })
+    dist = os.path.join(folia, "dist")
+    must(os.path.isdir(dist), "缺少 dist 构建产物")
+    must(os.path.isfile(os.path.join(dist, "index.html")), "dist/index.html 不存在")
+
+    # ---------- 4. 注入桥接层 ----------
+    bridge_dir = os.path.join(dist, "bridge")
+    os.makedirs(bridge_dir, exist_ok=True)
+    for name in ("mr-standalone.js", "folia-bridge.js"):
+        src = os.path.join(PATCH_DIR, name)
+        must(os.path.isfile(src), "补丁缺失: " + name)
+        shutil.copy(src, os.path.join(bridge_dir, name))
+        log("注入 %s (%.1f KB)" % (name, os.path.getsize(src) / 1024.0))
+    qr_dst = os.path.join(bridge_dir, "qrcode.js")
+    if args.qrcode and os.path.exists(args.qrcode):
+        shutil.copy(args.qrcode, qr_dst)
+    else:
+        download(QRCODE_URL, qr_dst)
+    must(os.path.getsize(qr_dst) > 10000, "qrcode.js 体积异常")
+
+    idx = os.path.join(dist, "index.html")
+    html = read(idx)
+    if "folia-bridge.js" not in html:
+        before = html
+        html = re.sub(r'<script id="vite-plugin-pwa:register-sw"[^>]*></script>', '', html)
+        must(html != before, "未找到 register-sw 脚本（SW 未关闭）")
+        anchor = '<script type="module"'
+        must(anchor in html, "index.html 未找到主模块锚点")
+        html = html.replace(anchor,
+                            '<!-- Folia iOS 独立版桥接层 -->\n'
+                            '  <script src="/bridge/qrcode.js"></script>\n'
+                            '  <script src="/bridge/mr-standalone.js"></script>\n'
+                            '  <script src="/bridge/folia-bridge.js"></script>\n'
+                            '  ' + anchor, 1)
+        write(idx, html)
+        log("index.html 已注入桥接层并关闭 SW")
+
+    # ---------- 5. iOS 工程骨架 ----------
+    if args.src_ios:
+        ios_src = os.path.join(os.path.abspath(args.src_ios), "ios")
+    else:
+        zp = download(IOS_ZIP, os.path.join(tmp, "ios.zip"))
+        root = unzip_first_dir(zp, os.path.join(tmp, "iosrepo"))
+        ios_src = os.path.join(root, "ios")
+    if not os.path.isdir(ios_src):
+        die("找不到 iOS 骨架: " + ios_src)
+
+    ios_dst = os.path.join(folia, "ios")
+    if os.path.isdir(ios_dst):
+        shutil.rmtree(ios_dst, ignore_errors=True)
+    shutil.copytree(ios_src, ios_dst)
+    log("ios/ <- Capacitor 工程骨架")
+    log("构建目录: " + folia + "（CI 后续步骤在此执行 cap sync / xcodebuild）")
+
+    app_dir = os.path.join(ios_dst, "App", "App")
+    for fn in ("MineradioPlugin.swift", "MineradioPlugin.m"):
+        src = os.path.join(PATCH_DIR, "ios", fn)
+        must(os.path.isfile(src), "补丁缺失: ios/" + fn)
+        shutil.copy(src, os.path.join(app_dir, fn))
+    log("原生插件已就位（URLSession 通道 + Cookie）")
+
+    # Info.plist：横屏优先 + 允许 http 资源
+    plist = os.path.join(app_dir, "Info.plist")
+    t = read(plist)
+    old_orient = ("\t<key>UISupportedInterfaceOrientations</key>\n\t<array>\n"
+                  "\t\t<string>UIInterfaceOrientationPortrait</string>\n"
+                  "\t\t<string>UIInterfaceOrientationLandscapeLeft</string>\n"
+                  "\t\t<string>UIInterfaceOrientationLandscapeRight</string>\n\t</array>")
+    new_orient = ("\t<key>UISupportedInterfaceOrientations</key>\n\t<array>\n"
+                  "\t\t<string>UIInterfaceOrientationLandscapeLeft</string>\n"
+                  "\t\t<string>UIInterfaceOrientationLandscapeRight</string>\n"
+                  "\t\t<string>UIInterfaceOrientationPortrait</string>\n\t</array>\n"
+                  "\t<key>NSAppTransportSecurity</key>\n\t<dict>\n"
+                  "\t\t<key>NSAllowsArbitraryLoads</key>\n\t\t<true/>\n"
+                  "\t\t<key>NSAllowsArbitraryLoadsInWebContent</key>\n\t\t<true/>\n\t</dict>")
+    must(old_orient in t, "Info.plist 未找到方向配置锚点")
+    write(plist, t.replace(old_orient, new_orient))
+    log("已打补丁: Info.plist")
+
+    # pbxproj：包名/版本 + 插件入编译
+    pbx = os.path.join(ios_dst, "App", "App.xcodeproj", "project.pbxproj")
+    t = read(pbx)
+    t = t.replace("PRODUCT_BUNDLE_IDENTIFIER = com.mineradio.v2;",
+                  "PRODUCT_BUNDLE_IDENTIFIER = com.folia.ios;")
+    t = t.replace("MARKETING_VERSION = 1.0;", "MARKETING_VERSION = 0.7.18;")
+    swift_bf, objc_bf = "AA00000000000000000000B1", "AA00000000000000000000B2"
+    swift_fr, objc_fr = "AA00000000000000000000F1", "AA00000000000000000000F2"
+    bf_anchor = ("\t\t504EC3081FED79650016851F /* AppDelegate.swift in Sources */ = "
+                 "{isa = PBXBuildFile; fileRef = 504EC3071FED79650016851F /* AppDelegate.swift */; };")
+    fr_anchor = ("\t\t504EC3071FED79650016851F /* AppDelegate.swift */ = "
+                 "{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = \"<group>\"; };")
+    grp_anchor = "\t\t\t\t504EC3071FED79650016851F /* AppDelegate.swift */,"
+    src_anchor = "\t\t\t\t504EC3081FED79650016851F /* AppDelegate.swift in Sources */,"
+    for a, n in ((bf_anchor, "PBXBuildFile"), (fr_anchor, "PBXFileReference"),
+                 (grp_anchor, "group"), (src_anchor, "Sources")):
+        must(a in t, "pbxproj 未找到 %s 锚点" % n)
+    t = t.replace(bf_anchor, bf_anchor + "\n"
+                  "\t\t%s /* MineradioPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = %s /* MineradioPlugin.swift */; };\n"
+                  "\t\t%s /* MineradioPlugin.m in Sources */ = {isa = PBXBuildFile; fileRef = %s /* MineradioPlugin.m */; };" % (swift_bf, swift_fr, objc_bf, objc_fr))
+    t = t.replace(fr_anchor, fr_anchor + "\n"
+                  "\t\t%s /* MineradioPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MineradioPlugin.swift; sourceTree = \"<group>\"; };\n"
+                  "\t\t%s /* MineradioPlugin.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = MineradioPlugin.m; sourceTree = \"<group>\"; };" % (swift_fr, objc_fr))
+    t = t.replace(grp_anchor, grp_anchor + "\n"
+                  "\t\t\t\t%s /* MineradioPlugin.swift */,\n"
+                  "\t\t\t\t%s /* MineradioPlugin.m */," % (swift_fr, objc_fr))
+    t = t.replace(src_anchor, src_anchor + "\n"
+                  "\t\t\t\t%s /* MineradioPlugin.swift in Sources */,\n"
+                  "\t\t\t\t%s /* MineradioPlugin.m in Sources */," % (swift_bf, objc_bf))
+    must("MineradioPlugin.swift in Sources" in t, "pbxproj 插件未入编译清单")
+    write(pbx, t)
+    log("已打补丁: project.pbxproj（com.folia.ios / 插件入编译）")
+
+    # ---------- 6. Capacitor 配置 ----------
+    write(os.path.join(folia, "capacitor.config.json"), json.dumps({
+        "appId": "com.folia.ios",
+        "appName": "Folia",
+        "webDir": "dist",
+        "plugins": {
+            "CapacitorHttp": {"enabled": True},
+            "CapacitorCookies": {"enabled": True}
+        },
+        "ios": {
+            "contentInset": "never",
+            "backgroundColor": "#09090b",
+            "allowsLinkPreview": False
+        },
+        "server": {"iosScheme": "capacitor"}
+    }, ensure_ascii=False, indent=2))
+    log("capacitor.config.json 已写入（webDir=dist）")
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---------- 自检 ----------
+    checks = [
+        (os.path.join(dist, "index.html"), "Web 入口"),
+        (os.path.join(bridge_dir, "mr-standalone.js"), "桥接基础设施"),
+        (os.path.join(bridge_dir, "folia-bridge.js"), "Folia 路由"),
+        (os.path.join(app_dir, "MineradioPlugin.swift"), "原生插件"),
+        (os.path.join(ios_dst, "App", "App.xcodeproj", "project.pbxproj"), "Xcode 工程"),
+        (os.path.join(ios_dst, "App", "App", "Assets.xcassets", "AppIcon.appiconset", "icon-1024.jpg"), "App 图标"),
+        (os.path.join(folia, "capacitor.config.json"), "Capacitor 配置"),
+    ]
+    for path, name in checks:
+        must(os.path.exists(path), "缺失: " + name + " -> " + path)
+        log("OK  %s" % name)
+
+    dist_size = sum(os.path.getsize(os.path.join(b, f))
+                    for b, _, fs in os.walk(dist) for f in fs)
+    log("Web 包体积: %.1f MB" % (dist_size / 1048576.0))
+
+    if FAILS:
+        log("==== 有 %d 项校验失败 ====" % len(FAILS))
+        for f in FAILS:
+            log("  - " + f)
+        sys.exit(1)
+    log("==== 组装完成 ====")
+
+
+if __name__ == "__main__":
+    main()
