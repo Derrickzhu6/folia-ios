@@ -1,9 +1,12 @@
 import Foundation
 import Capacitor
+import AVFoundation
+import MediaPlayer
 
 /**
  * Mineradio Native API Plugin
- * 为 iOS 独立版提供无 CORS 的原生 HTTP 通道（URLSession + 持久 Cookie 会话）。
+ * 为 iOS 独立版提供无 CORS 的原生 HTTP 通道（URLSession + 持久 Cookie 会话），
+ * 以及 iOS 播放必需的音频会话配置与锁屏/耳机控制。
  * 由 public/js/mr-standalone.js 通过 Capacitor.Plugins.Mineradio 调用。
  */
 @objc(MineradioPlugin)
@@ -21,6 +24,88 @@ public class MineradioPlugin: CAPPlugin {
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         return URLSession(configuration: config)
     }()
+
+    private static var audioConfigured = false
+    private static var remoteConfigured = false
+
+    // MARK: - 生命周期
+
+    public override func load() {
+        configureAudioSession()
+        configureRemoteCommands()
+    }
+
+    // MARK: - 音频会话（没有它，锁屏/切后台后 WKWebView 的播放会被系统掐断）
+
+    private func configureAudioSession() {
+        guard !MineradioPlugin.audioConfigured else { return }
+        MineradioPlugin.audioConfigured = true
+        DispatchQueue.main.async {
+            do {
+                let session = AVAudioSession.sharedInstance()
+                // .playback：允许后台播放 + 锁屏继续出声
+                try session.setCategory(.playback, mode: .default, options: [.allowAirPlay, .allowBluetooth])
+                try session.setActive(true)
+                NSLog("[Mineradio] AVAudioSession 已配置（后台播放可用）")
+            } catch {
+                NSLog("[Mineradio] AVAudioSession 配置失败: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    // MARK: - 锁屏 / 耳机 / 控制中心
+
+    /// 把系统控制事件转发给 H5，由页面自己响应（不依赖具体前端实现）
+    private func configureRemoteCommands() {
+        guard !MineradioPlugin.remoteConfigured else { return }
+        MineradioPlugin.remoteConfigured = true
+        let cc = MPRemoteCommandCenter.shared()
+        let emit: (String, MPRemoteCommand) -> Void = { [weak self] name, command in
+            command.addTarget { _ in
+                self?.notifyListeners("remoteCommand", data: ["command": name])
+                return .success
+            }
+        }
+        emit("play", cc.playCommand)
+        emit("pause", cc.pauseCommand)
+        emit("toggle", cc.togglePlayPauseCommand)
+        emit("next", cc.nextTrackCommand)
+        emit("previous", cc.previousTrackCommand)
+        // 让控制中心始终显示播放控件（即便当前没有正在播放的 item）
+        UIApplication.shared.beginReceivingRemoteControlEvents()
+    }
+
+    /// 由 H5 调用：更新锁屏上显示的歌曲信息
+    @objc func setNowPlaying(_ call: CAPPluginCall) {
+        var info: [String: Any] = [:]
+        let title = call.getString("title") ?? ""
+        let artist = call.getString("artist") ?? ""
+        let album = call.getString("album") ?? ""
+        let duration = call.getDouble("duration") ?? 0      // 秒
+        let position = call.getDouble("position") ?? 0
+        if !title.isEmpty { info[MPMediaItemPropertyTitle] = title }
+        if !artist.isEmpty { info[MPMediaItemPropertyArtist] = artist }
+        if !album.isEmpty { info[MPMediaItemPropertyAlbumTitle] = album }
+        if duration > 0 { info[MPMediaItemPropertyPlaybackDuration] = duration }
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = position
+        info[MPNowPlayingInfoPropertyPlaybackRate] = call.getBool("playing") ?? true ? 1.0 : 0.0
+
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+
+        // 封面（异步下载）
+        if let cover = call.getString("cover"), let url = URL(string: cover), !cover.isEmpty {
+            URLSession.shared.dataTask(with: url) { data, _, _ in
+                guard let data = data, let image = UIImage(data: data) else { return }
+                let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+                DispatchQueue.main.async {
+                    var merged = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+                    merged[MPMediaItemPropertyArtwork] = artwork
+                    MPNowPlayingInfoCenter.default().nowPlayingInfo = merged
+                }
+            }.resume()
+        }
+        call.resolve(["ok": true])
+    }
 
     // MARK: - 基础
 

@@ -1375,20 +1375,167 @@
     });
   }
 
+  // ---------- 横屏 / 竖屏双向适配 ----------
+  // 竖屏时给内容一个「横屏设计最小宽度」，让它不压缩而是溢出，再由自动 zoom 等比缩小，
+  // 最后垂直居中 + 背景填充。结果：横屏、竖屏都是完整且不变形的画面。
+  var MR_PORTRAIT_MIN_W = 900;
+
+  function ensureFitStyle() {
+    if (document.getElementById('mr-fit-style')) return;
+    var st = document.createElement('style');
+    st.id = 'mr-fit-style';
+    st.textContent = [
+      /* 竖屏：把缩放后的横屏画布垂直居中，上下用背景色填满，避免出现大片空白错位 */
+      'html.mr-portrait-fit{background:#0a0a0c;display:flex;align-items:center;justify-content:center;',
+      'min-height:100vh;overflow-x:hidden;}',
+      'html.mr-portrait-fit>body{flex:0 0 auto;}'
+    ].join('');
+    document.head.appendChild(st);
+  }
+
+  function updateOrientationFit() {
+    var portrait = window.innerHeight > window.innerWidth;
+    var de = document.documentElement;
+    if (portrait && window.__MR_LANDSCAPE_ONLY__) {
+      ensureFitStyle();
+      de.classList.add('mr-portrait-fit');
+      document.body.style.minWidth = MR_PORTRAIT_MIN_W + 'px';
+    } else {
+      de.classList.remove('mr-portrait-fit');
+      document.body.style.minWidth = '';
+    }
+  }
+
+  // ---------- 锁屏 / 耳机 / 控制中心 ----------
+  // 原生侧已启用 MPRemoteCommandCenter，这里把系统事件翻译成页面能懂的操作：
+  // 先发自定义事件（前端若监听则用），再退化为「空格键 + 找按钮点击」的通用兜底。
+  var REMOTE_WORDS = {
+    toggle: /播放|暂停|play|pause/i,
+    play: /播放|play/i,
+    pause: /暂停|pause/i,
+    next: /下一首|下一曲|下一个|next/i,
+    previous: /上一首|上一曲|上一个|prev/i
+  };
+
+  function clickPlayerButton(kind) {
+    var re = REMOTE_WORDS[kind] || REMOTE_WORDS.toggle;
+    var sels = 'button,[role=button],a,div,span,svg';
+    var els = document.querySelectorAll(sels);
+    for (var i = 0; i < els.length; i++) {
+      var e = els[i];
+      if (e.children && e.children.length > 3) continue;
+      var r = e.getBoundingClientRect();
+      if (r.width < 12 || r.height < 12 || r.width > 220) continue;
+      var label = (e.getAttribute('aria-label') || e.getAttribute('title') ||
+        e.getAttribute('data-tip') || e.innerText || '').trim();
+      if (label && label.length < 24 && re.test(label)) { e.click(); return true; }
+    }
+    return false;
+  }
+
+  function handleRemoteCommand(cmd) {
+    // 1) 给前端一个标准事件，谁监听谁处理
+    try {
+      document.dispatchEvent(new CustomEvent('mrRemoteCommand', { detail: { command: cmd } }));
+      window.dispatchEvent(new CustomEvent('mrRemoteCommand', { detail: { command: cmd } }));
+    } catch (e) { }
+    // 2) 通用兜底：空格键（多数播放器都有这个快捷键）
+    if (cmd === 'toggle' || cmd === 'play' || cmd === 'pause') {
+      var ev = new KeyboardEvent('keydown', { key: ' ', code: 'Space', keyCode: 32, which: 32, bubbles: true });
+      (document.activeElement || document.body).dispatchEvent(ev);
+      document.dispatchEvent(ev);
+    }
+    // 3) 再兜底：按文案找播放控件点一下
+    clickPlayerButton(cmd);
+  }
+
+  function initRemoteControls() {
+    var P = nativePlugin();
+    if (!P || typeof P.addListener !== 'function') return;
+    try {
+      P.addListener('remoteCommand', function (d) {
+        var c = (d && d.command) || 'toggle';
+        console.log('[Mineradio] 系统控制事件:', c);
+        handleRemoteCommand(c);
+      });
+    } catch (e) { }
+    // 播放状态变化时同步到锁屏（尽力而为，取不到就只显示标题）
+    try {
+      var timer = setInterval(function () {
+        var a = document.querySelector('audio, video');
+        if (!a || P.setNowPlaying === undefined) return;
+        var title = document.title || '';
+        P.setNowPlaying({
+          title: title.replace(/\s*[-–—|].*$/, '').slice(0, 60),
+          artist: '',
+          duration: isFinite(a.duration) ? a.duration : 0,
+          position: isFinite(a.currentTime) ? a.currentTime : 0,
+          playing: !a.paused
+        });
+      }, 3000);
+    } catch (e) { }
+  }
+
+  // ---------- 键盘避让 ----------
+  // iOS 上软键盘弹出不会改变布局（WebView 不自动滚动），输入框和搜索结果会被键盘盖住。
+  // 监听 visualViewport 把页面底部顶起来，并把正在输入的框滚到可视区中间。
+  function initKeyboardInset() {
+    if (!window.visualViewport) return;
+    var vv = window.visualViewport;
+    var lastH = 0;
+    function onVV() {
+      var offset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+      document.documentElement.style.setProperty('--mr-kb', offset + 'px');
+      document.documentElement.style.paddingBottom = offset > 40 ? offset + 'px' : '';
+      var el = document.activeElement;
+      var tag = el && el.tagName;
+      // 只在键盘刚弹出时滚一次，避免每次输入都跳
+      if (tag === 'INPUT' || tag === 'TEXTAREA') {
+        if (offset > 40 && Math.abs(offset - lastH) > 40) {
+          setTimeout(function () {
+            try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) { }
+          }, 220);
+        }
+      }
+      lastH = offset;
+    }
+    vv.addEventListener('resize', onVV);
+    vv.addEventListener('scroll', onVV);
+  }
+
   function initScreenFit() {
     try {
-      // 允许延伸到安全区；缩放范围放宽，配合下面的自动 zoom
+      // 关键：不要加 viewport-fit=cover。这些 H5 完全没有 iOS 安全区处理，
+      // 加了 cover 内容就会伸到刘海/灵动岛和底部 Home 条底下被挡住。
+      // 保持默认（auto）让系统自动把视口内缩到安全区，再叠一层 env() 兜底。
       var vp = document.querySelector('meta[name="viewport"]');
       if (vp) {
         vp.setAttribute('content',
-          'width=device-width, initial-scale=1.0, minimum-scale=0.5, maximum-scale=2.0, user-scalable=yes, viewport-fit=cover');
+          'width=device-width, initial-scale=1.0, minimum-scale=0.5, maximum-scale=2.0, user-scalable=yes');
       }
       var st = document.createElement('style');
-      st.textContent =
-        'html{-webkit-text-size-adjust:100%;}' +
-        'body{overscroll-behavior:none;}';
+      st.id = 'mr-ios-base';
+      st.textContent = [
+        'html{-webkit-text-size-adjust:100%;touch-action:manipulation;',
+        /* 兜底：万一 WebView 强制全屏（env() 才有值），就把内容顶开 */
+        'padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px);',
+        'background:#0a0a0c;box-sizing:border-box;}',
+        'body{overscroll-behavior:none;}',
+        /* 避免长按歌词/封面弹出系统菜单误触，输入框保留 */
+        '*{ -webkit-touch-callout:none; }',
+        'input,textarea,select{ -webkit-touch-callout:default; }',
+        /* 触屏没有 hover：那些「悬停才浮现」的按钮（Tailwind 的 group-hover:opacity-100）
+           在手机上会永远隐形、点不到，这里让它们常驻显示 */
+        '@media (hover:none){',
+        '  [class*="group-hover:opacity-100"],[class*="group-hover\\:opacity-100"]{opacity:1 !important;}',
+        '  [class*="peer-hover:opacity-100"]{opacity:1 !important;}',
+        '}'
+      ].join('');
       document.head.appendChild(st);
     } catch (e) { }
+
+    initKeyboardInset();
+    initRemoteControls();
 
     if (fitRead() === 'auto') fitState.measured = measureContent();
     applyFit(fitRead());
@@ -1406,10 +1553,18 @@
     });
 
     var ro = window.addEventListener.bind(window);
-    ro('resize', function () { if (fitState.mode === 'auto') applyFit('auto'); });
-    ro('orientationchange', function () {
-      setTimeout(function () { if (fitState.mode === 'auto') applyFit('auto'); }, 500);
+    ro('resize', function () {
+      if (fitState.mode === 'auto') applyFit('auto');
+      if (window.__MR_LANDSCAPE_ONLY__) updateOrientationFit();
     });
+    ro('orientationchange', function () {
+      setTimeout(function () {
+        if (fitState.mode === 'auto') applyFit('auto');
+        if (window.__MR_LANDSCAPE_ONLY__) updateOrientationFit();
+      }, 500);
+    });
+
+    if (window.__MR_LANDSCAPE_ONLY__) updateOrientationFit();
 
     try {
       if (localStorage.getItem('mr_ios_fit_hidden') === '1') return;

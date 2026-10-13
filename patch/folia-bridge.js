@@ -612,7 +612,7 @@
       desc: '2x 分辨率 + 60 帧（推荐）'
     },
     ultra: {
-      label: '极致', dpr: 0, fps: '120',
+      label: '极致', dpr: 0, fps: 'off',
       settings: {
         'visualizer_glow_blur_quantize': '',
         'disable_visualizer_vignette': '',

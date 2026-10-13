@@ -253,8 +253,17 @@ def main():
         t = t.replace("<key>CFBundleDisplayName</key>\n\t<string>Mineradio</string>",
                       "<key>CFBundleDisplayName</key>\n\t<string>Folia</string>")
     must("<string>Folia</string>" in t, "Info.plist 显示名未替换为 Folia")
+
+    # 状态栏：Folia 是深色界面，默认黑色状态栏文字在上面几乎看不见 -> 改成白色
+    if "UIStatusBarStyle" not in t:
+        t = t.replace("</dict>",
+                      "\t<key>UIStatusBarStyle</key>\n\t<string>UIStatusBarStyleLightContent</string>\n"
+                      "\t<key>UIViewControllerBasedStatusBarAppearance</key>\n\t<false/>\n</dict>", 1)
+    # 全屏（iOS 11+ 下让系统正确处理安全区），并允许自动旋转
+    if "UIRequiresFullScreen" not in t:
+        t = t.replace("</dict>", "\t<key>UIRequiresFullScreen</key>\n\t<true/>\n</dict>", 1)
     write(plist, t)
-    log("已打补丁: Info.plist（横屏+竖屏 / ATS / 显示名 Folia）")
+    log("已打补丁: Info.plist（横屏+竖屏 / ATS / 显示名 Folia / 白色状态栏）")
 
     # ---------- 5b. App 图标 / 启动图：由 Folia 的 icon.svg 光栅化 ----------
     icon_png = os.path.join(app_dir, "Assets.xcassets", "AppIcon.appiconset", "AppIcon-512@2x.png")
@@ -351,7 +360,9 @@ img{width:760px;height:760px}
             "CapacitorCookies": {"enabled": True}
         },
         "ios": {
-            "contentInset": "never",
+            # automatic：让 WKWebView 自动避开刘海/灵动岛与底部 Home 条。
+            # 之前设成 never 会让内容伸到安全区底下被挡住（H5 没有任何 safe-area 处理）。
+            "contentInset": "automatic",
             "backgroundColor": "#09090b",
             "allowsLinkPreview": False
         },

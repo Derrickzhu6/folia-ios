@@ -7,4 +7,5 @@ CAP_PLUGIN(MineradioPlugin, "Mineradio",
            CAP_PLUGIN_METHOD(httpRequest, CAPPluginReturnPromise);
            CAP_PLUGIN_METHOD(setCookies, CAPPluginReturnPromise);
            CAP_PLUGIN_METHOD(clearCookies, CAPPluginReturnPromise);
+           CAP_PLUGIN_METHOD(setNowPlaying, CAPPluginReturnPromise);
 )
