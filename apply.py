@@ -244,8 +244,69 @@ def main():
                   "\t\t<key>NSAllowsArbitraryLoads</key>\n\t\t<true/>\n"
                   "\t\t<key>NSAllowsArbitraryLoadsInWebContent</key>\n\t\t<true/>\n\t</dict>")
     must(old_orient in t, "Info.plist 未找到方向配置锚点")
-    write(plist, t.replace(old_orient, new_orient))
-    log("已打补丁: Info.plist")
+    t = t.replace(old_orient, new_orient)
+    # App 显示名（脚手架里写死了 Mineradio）
+    t = t.replace("<key>CFBundleDisplayName</key>\n        <string>Mineradio</string>",
+                  "<key>CFBundleDisplayName</key>\n        <string>Folia</string>")
+    if "<string>Folia</string>" not in t:
+        # 兼容不同缩进
+        t = t.replace("<key>CFBundleDisplayName</key>\n\t<string>Mineradio</string>",
+                      "<key>CFBundleDisplayName</key>\n\t<string>Folia</string>")
+    must("<string>Folia</string>" in t, "Info.plist 显示名未替换为 Folia")
+    write(plist, t)
+    log("已打补丁: Info.plist（横屏+竖屏 / ATS / 显示名 Folia）")
+
+    # ---------- 5b. App 图标 / 启动图：由 Folia 的 icon.svg 光栅化 ----------
+    icon_png = os.path.join(app_dir, "Assets.xcassets", "AppIcon.appiconset", "AppIcon-512@2x.png")
+    svg_candidates = [
+        os.path.join(folia, "dist", "icon.svg"),
+        os.path.join(folia, "public", "icon.svg"),
+    ]
+    svg = next((p for p in svg_candidates if os.path.isfile(p)), None)
+    if svg:
+        outdir = os.path.join(tmp, "icon")
+        os.makedirs(outdir, exist_ok=True)
+        made = os.path.join(outdir, "icon-1024.png")
+        # 包一层深色底 + 留白，做成规范 App 图标
+        wrapper = os.path.join(outdir, "icon.html")
+        write(wrapper, """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+html,body{margin:0;padding:0;width:1024px;height:1024px;background:#0b0d10;overflow:hidden}
+.wrap{width:1024px;height:1024px;display:flex;align-items:center;justify-content:center}
+img{width:760px;height:760px}
+</style></head><body><div class="wrap"><img src="%s"></div></body></html>""" % os.path.basename(svg))
+        shutil.copy(svg, os.path.join(outdir, os.path.basename(svg)))
+        ok = False
+        chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if os.path.exists(chrome):
+            try:
+                subprocess.run([chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
+                                "--hide-scrollbars", "--window-size=1024,1024",
+                                "--screenshot=" + made, "file://" + wrapper],
+                               check=True, capture_output=True, timeout=180)
+                ok = os.path.isfile(made) and os.path.getsize(made) > 5000
+            except Exception as e:
+                log("!! Chrome 光栅化失败: %s" % e)
+        if not ok:
+            try:
+                subprocess.run(["qlmanage", "-t", "-s", "1024", "-o", outdir, svg],
+                               check=True, capture_output=True, timeout=120)
+                alt = os.path.join(outdir, os.path.basename(svg) + ".png")
+                if os.path.isfile(alt) and os.path.getsize(alt) > 5000:
+                    shutil.move(alt, made)
+                    ok = True
+            except Exception as e:
+                log("!! qlmanage 光栅化失败: %s" % e)
+        if ok:
+            shutil.copy(made, icon_png)
+            for name in ("splash-2732x2732.png", "splash-2732x2732-1.png", "splash-2732x2732-2.png"):
+                sp = os.path.join(app_dir, "Assets.xcassets", "Splash.imageset", name)
+                if os.path.isfile(sp):
+                    shutil.copy(made, sp)
+            log("App 图标/启动图已替换为 Folia（%.1f KB）" % (os.path.getsize(made) / 1024.0))
+        else:
+            log("!! 图标光栅化不可用，保留原图标（不影响功能）")
+    else:
+        log("!! 未找到 Folia 图标 SVG，保留原图标")
 
     # pbxproj：包名/版本 + 插件入编译
     pbx = os.path.join(ios_dst, "App", "App.xcodeproj", "project.pbxproj")
