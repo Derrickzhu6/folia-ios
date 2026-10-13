@@ -254,14 +254,21 @@ def main():
                       "<key>CFBundleDisplayName</key>\n\t<string>Folia</string>")
     must("<string>Folia</string>" in t, "Info.plist 显示名未替换为 Folia")
 
-    # 状态栏：Folia 是深色界面，默认黑色状态栏文字在上面几乎看不见 -> 改成白色
+    # 状态栏：Folia 是深色界面，默认黑色状态栏文字在上面几乎看不见 -> 改成白色。
+    # 注意必须插到「最外层」dict 的闭合前（rfind），插到第一个 </dict> 会落到 ATS 子字典里而失效。
     if "UIStatusBarStyle" not in t:
-        t = t.replace("</dict>",
-                      "\t<key>UIStatusBarStyle</key>\n\t<string>UIStatusBarStyleLightContent</string>\n"
-                      "\t<key>UIViewControllerBasedStatusBarAppearance</key>\n\t<false/>\n</dict>", 1)
-    # 全屏（iOS 11+ 下让系统正确处理安全区），并允许自动旋转
-    if "UIRequiresFullScreen" not in t:
-        t = t.replace("</dict>", "\t<key>UIRequiresFullScreen</key>\n\t<true/>\n</dict>", 1)
+        i = t.rfind("</dict>")
+        if i > 0:
+            t = t[:i] + (
+                "\t<key>UIStatusBarStyle</key>\n\t<string>UIStatusBarStyleLightContent</string>\n"
+            ) + t[i:]
+    # 骨架里这项是 true，会让上面那行失效，必须改成 false
+    t = t.replace(
+        "<key>UIViewControllerBasedStatusBarAppearance</key>\n\t<true/>",
+        "<key>UIViewControllerBasedStatusBarAppearance</key>\n\t<false/>")
+    t = t.replace(
+        "<key>UIViewControllerBasedStatusBarAppearance</key>\n        <true/>",
+        "<key>UIViewControllerBasedStatusBarAppearance</key>\n        <false/>")
     write(plist, t)
     log("已打补丁: Info.plist（横屏+竖屏 / ATS / 显示名 Folia / 白色状态栏）")
 
