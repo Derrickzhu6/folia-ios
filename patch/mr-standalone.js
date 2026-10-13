@@ -92,15 +92,35 @@
         url: url,
         method: opts.method || 'GET',
         headers: headers,
-        body: opts.body || null
+        body: opts.body || null,
+        binary: !!opts.binary
       }).then(function (res) {
-        return { status: (res && res.status) || 0, text: (res && res.body) || '' };
+        return {
+          status: (res && res.status) || 0,
+          text: (res && res.body) || '',
+          headers: (res && res.headers) || {},
+          base64: (res && res.bodyBase64) || ''
+        };
       });
     }
     var init = { method: opts.method || 'GET', headers: headers, credentials: 'omit' };
-    if (opts.body) init.body = opts.body;
+    if (opts.body && init.method !== 'GET') init.body = opts.body;
     return fetch(url, init).then(function (r) {
-      return r.text().then(function (t) { return { status: r.status, text: t }; });
+      var hdrs = {};
+      try { r.headers && r.headers.forEach(function (v, k) { hdrs[k] = v; }); } catch (e) { }
+      if (opts.binary && typeof r.arrayBuffer === 'function') {
+        return r.arrayBuffer().then(function (ab) {
+          var bytes = new Uint8Array(ab);
+          var s = '';
+          for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+          var b64 = '';
+          try { b64 = btoa(s); } catch (e) { }
+          return { status: r.status, text: '', headers: hdrs, base64: b64 };
+        });
+      }
+      return r.text().then(function (t) {
+        return { status: r.status, text: t, headers: hdrs, base64: '' };
+      });
     });
   }
 
@@ -309,6 +329,36 @@
     });
   }
 
+  // vkey 的 filename 必须用 file.media_mid 拼（用歌曲 mid 一律返回 104003）
+  function qqMediaMid(mid) {
+    if (!mid) return Promise.resolve({ mediaMid: '' });
+    var u = 'https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg?songmid=' +
+      encodeURIComponent(mid) + '&platform=yqq&format=json';
+    return nativeHttp(u, { headers: { 'Referer': 'https://y.qq.com/', 'User-Agent': QQ_UA } })
+      .then(function (r) {
+        var d = JSON.parse(r.text || '{}');
+        var s = (d.data && d.data[0]) || {};
+        var f = s.file || {};
+        return {
+          mediaMid: f.media_mid || '', id: s.id || 0, name: s.title || '',
+          payPlay: (s.pay && s.pay.pay_play) || 0
+        };
+      })
+      .catch(function () { return { mediaMid: '' }; });
+  }
+
+  // 自动解析 media_mid 后再取播放地址（VIP 曲目会得到 104003，属正常）
+  function qqSongUrlAuto(mid) {
+    return qqMediaMid(mid).then(function (info) {
+      return qqSongUrl(mid, info.mediaMid).then(function (r) {
+        r.mediaMid = info.mediaMid;
+        r.songId = info.id;
+        r.payPlay = info.payPlay;
+        return r;
+      });
+    });
+  }
+
   function qqSongUrl(mid, mediaMid) {
     var guid = String(10000000 + Math.floor(Math.random() * 90000000));
     var filenames = [];
@@ -495,13 +545,18 @@
     };
   }
 
-  function kugouSearchSongs(kw, limit, offset) {
+  function kugouSearchRaw(kw, limit, offset) {
     var page = Math.floor(offset / limit) + 1;
     var url = 'https://songsearch.kugou.com/song_search_v2?keyword=' + encodeURIComponent(kw) +
       '&page=' + page + '&pagesize=' + limit + '&format=json&platform=WebFilter';
     return nativeHttp(url, { headers: KG_HEADERS }).then(function (r) {
       var d = JSON.parse(r.text);
-      var lists = (d.data && d.data.lists) || [];
+      return (d.data && d.data.lists) || [];
+    });
+  }
+
+  function kugouSearchSongs(kw, limit, offset) {
+    return kugouSearchRaw(kw, limit, offset).then(function (lists) {
       return lists.map(mapKugouTrack).filter(function (s) { return s.name && (s.hash || s.mixSongId); });
     });
   }
@@ -936,16 +991,46 @@
     return Promise.resolve({ status: status || 200, body: JSON.stringify(obj) });
   }
 
+  /**
+   * 路由解析：先精确匹配，再逐级去掉尾部路径段做前缀匹配，
+   * 从而支持 /qqapi/getMusicPlay/{songmid} 这类路径参数式路由。
+   * 命中时返回 { fn, rest }，rest 即被吃掉的路径参数。
+   */
+  function resolveHandler(pathname) {
+    if (Object.prototype.hasOwnProperty.call(HANDLERS, pathname)) {
+      return { fn: HANDLERS[pathname], rest: '' };
+    }
+    var cut = pathname.length;
+    while (cut > 1) {
+      cut = pathname.lastIndexOf('/', cut - 1);
+      if (cut <= 0) break;
+      var base = pathname.slice(0, cut);
+      if (Object.prototype.hasOwnProperty.call(HANDLERS, base)) {
+        return { fn: HANDLERS[base], rest: pathname.slice(cut + 1) };
+      }
+    }
+    return null;
+  }
+
   function handleApi(pathname, params, init) {
-    var fn = HANDLERS[pathname];
-    if (!fn) {
+    var hit = resolveHandler(pathname);
+    if (!hit) {
       // 未实现：返回 503，让前端走 try/catch 优雅降级
       console.log('[MR-API] 503 (unimplemented):', pathname);
       return jsonResponse(DEFAULT_503, 503);
     }
     return Promise.resolve()
-      .then(function () { return fn(params, init); })
+      .then(function () { return hit.fn(params, init, hit.rest); })
       .then(function (data) {
+        // __MR_RAW__：原样回传上游响应体（代理场景，需保留 Content-Type 与原始字节）
+        if (data && data.__MR_RAW__) {
+          return {
+            status: data.status || 200,
+            body: data.body || '',
+            bytes: data.bytes || null,
+            contentType: data.contentType || 'text/plain; charset=utf-8'
+          };
+        }
         console.log('[MR-API] 200', pathname, JSON.stringify(data).slice(0, 220));
         return { status: 200, body: JSON.stringify(data) };
       })
@@ -970,9 +1055,10 @@
       if (known) {
         var params = new URLSearchParams(qi >= 0 ? u.slice(qi + 1) : '');
         return handleApi(pathname, params, init).then(function (r) {
-          return new Response(r.body, {
+          var ct = r.contentType || 'application/json; charset=utf-8';
+          return new Response(r.bytes || r.body, {
             status: r.status,
-            headers: { 'Content-Type': 'application/json; charset=utf-8' }
+            headers: { 'Content-Type': ct }
           });
         });
       }
@@ -991,6 +1077,27 @@
     qqSign: qqSign,
     nativePlugin: nativePlugin,
     httpsify: httpsify,
+    qqSongUrl: qqSongUrl,
+    qqMediaMid: qqMediaMid,
+    qqSongUrlAuto: qqSongUrlAuto,
+    qqLyric: qqLyric,
+    qqSearchSongs: qqSearchSongs,
+    kugouSongUrl: kugouSongUrl,
+    kugouLyric: kugouLyric,
+    kugouSearchRaw: kugouSearchRaw,
+    nat: { UA: UA, QQ_UA: QQ_UA, KG_UA: KG_UA },
+    // 原样回传上游响应（代理用）：text 文本或 bytes 二进制
+    rawResponse: function (status, body, contentType, bytes) {
+      return { __MR_RAW__: true, status: status, body: body || '', contentType: contentType || '', bytes: bytes || null };
+    },
+    base64ToBytes: function (b64) {
+      try {
+        var bin = atob(b64);
+        var out = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+      } catch (e) { return null; }
+    },
     registerRoutes: function (routes) {
       Object.keys(routes).forEach(function (path) { HANDLERS[path] = routes[path]; });
     }

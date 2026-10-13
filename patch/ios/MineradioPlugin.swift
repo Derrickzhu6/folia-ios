@@ -32,6 +32,8 @@ public class MineradioPlugin: CAPPlugin {
         let method = (call.getString("method") ?? "GET").uppercased()
         let headers = call.getObject("headers") as? [String: String] ?? [:]
         let body = call.getString("body")
+        // binary=true 时用 base64 回传原始字节，避免 UTF-8 解码把图片/加密响应破坏掉
+        let wantsBinary = call.getBool("binary") ?? false
 
         var req = URLRequest(url: url)
         req.httpMethod = method
@@ -68,11 +70,15 @@ public class MineradioPlugin: CAPPlugin {
                 }
             }
             let text = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-            call.resolve([
+            var result: [String: Any] = [
                 "status": http?.statusCode ?? 0,
                 "body": text,
                 "headers": headerMap
-            ])
+            ]
+            if wantsBinary, let data = data {
+                result["bodyBase64"] = data.base64EncodedString()
+            }
+            call.resolve(result)
         }.resume()
     }
 
