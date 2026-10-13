@@ -1476,6 +1476,25 @@
     } catch (e) { }
   }
 
+  // ---------- 音频跨域兜底 ----------
+  // 上游给 <audio> 加了 crossOrigin="anonymous"（桌面版靠 Electron 关掉 web 安全才没事）。
+  // iOS 的 WKWebView 严格执行 CORS，而音乐 CDN 不返回 Access-Control-Allow-Origin，
+  // 设了 anonymous 会直接加载失败 —— 一首都放不出来。这里让该属性永远为空：
+  // 代价是拿不到频谱数据（部分视觉特效会减弱），换来的是「能出声」。
+  function patchAudioCrossOrigin() {
+    try {
+      var Proto = window.HTMLMediaElement && window.HTMLMediaElement.prototype;
+      if (!Proto) return;
+      Object.defineProperty(Proto, 'crossOrigin', {
+        configurable: true,
+        get: function () { return null; },
+        set: function () { /* 忽略：跨域音频不能带 CORS 约束 */ }
+      });
+      console.log('[Mineradio] 已放宽音频 CORS 约束（iOS 必需）');
+    } catch (e) { }
+  }
+  patchAudioCrossOrigin();
+
   // ---------- 键盘避让 ----------
   // iOS 上软键盘弹出不会改变布局（WebView 不自动滚动），输入框和搜索结果会被键盘盖住。
   // 监听 visualViewport 把页面底部顶起来，并把正在输入的框滚到可视区中间。
