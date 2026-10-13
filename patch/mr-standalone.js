@@ -50,7 +50,11 @@
   // 写入登录 Cookie：优先自定义原生插件（URLSession 会话），其次官方 CapacitorCookies
   function cookieStoreSet(cookieStr, domain) {
     domain = domain || '.music.163.com';
-    var siteUrl = domain.indexOf('qq.com') >= 0 ? 'https://y.qq.com' : 'https://music.163.com';
+    var siteUrl = 'https://music.163.com';
+    if (domain.indexOf('qq.com') >= 0) siteUrl = 'https://y.qq.com';
+    else if (domain.indexOf('kugou.com') >= 0) siteUrl = 'https://www.kugou.com';
+    // 同步写进 JS cookie jar：原生 cookie storage 的写入时机不可控，jar 才是请求真正带上的那份
+    jarSet(siteUrl, cookieStr);
     var plugin = nativePlugin();
     if (plugin && typeof plugin.setCookies === 'function') {
       return plugin.setCookies({ cookie: cookieStr, domain: domain }).catch(function () { });
@@ -71,6 +75,7 @@
 
   function cookieStoreClear(domain) {
     domain = domain || 'music.163.com';
+    delete COOKIE_JAR[jarBaseHost(domain)];
     var plugin = nativePlugin();
     if (plugin && typeof plugin.clearCookies === 'function') {
       return plugin.clearCookies({ domain: domain }).catch(function () { });
@@ -83,10 +88,66 @@
   }
 
   // 原生 HTTP（App 内）或普通 fetch（浏览器调试）
+  // ---------- Cookie jar ----------
+  // 扫码登录要靠连续的会话：unikey 的 Set-Cookie 必须被后面的 check 带上。
+  // 系统 cookie storage 的同步不可靠，这里在 JS 侧自己维护一份，请求时显式带上。
+  var COOKIE_JAR = {};
+
+  // 统一按「基础域」归并：music.163.com / m.kugou.com / u.y.qq.com 各自域内的子域共享同一份 cookie。
+  // 读写用同一个 key，避免出现「存进去了但读的是另一个域」的情况。
+  function jarBaseHost(name) {
+    var h = String(name || '').replace(/^\./, '').replace(/^www\./, '').split('/')[0].toLowerCase();
+    var parts = h.split('.');
+    if (parts.length <= 2) return h;
+    var last2 = parts.slice(-2).join('.');
+    // com.cn / co.jp 这类双后缀要多留一级
+    if (/^(com|co|org|net|gov|edu|ac)\.(cn|jp|uk|au|hk|tw|kr)$/.test(last2) && parts.length >= 3) {
+      return parts.slice(-3).join('.');
+    }
+    return last2;
+  }
+
+  function jarHostOf(url) {
+    try { return jarBaseHost(new URL(url).hostname); } catch (e) { return ''; }
+  }
+
+  function jarMerge(host, cookieStr) {
+    if (!host || !cookieStr) return;
+    var jar = COOKIE_JAR[host] || {};
+    String(cookieStr).split(/;\s*|\s*,\s*(?=[A-Za-z0-9_\-]+=)/).forEach(function (seg) {
+      var i = seg.indexOf('=');
+      if (i <= 0) return;
+      var k = seg.slice(0, i).trim();
+      var v = seg.slice(i + 1).trim();
+      if (!k) return;
+      // 跳过 cookie 属性段（expires / path / domain / secure / httponly ...）
+      if (/^(expires|path|domain|secure|httponly|max-age|samesite|version|priority)$/i.test(k)) return;
+      if (v === '' || /^(EXPIRED|deleted)$/i.test(v)) delete jar[k];
+      else jar[k] = v;
+    });
+    COOKIE_JAR[host] = jar;
+  }
+
+  function jarGet(url) {
+    var jar = COOKIE_JAR[jarHostOf(url)];
+    if (!jar) return '';
+    return Object.keys(jar).map(function (k) { return k + '=' + jar[k]; }).join('; ');
+  }
+
+  function jarSet(url, cookieStr) {
+    jarMerge(jarHostOf(url), cookieStr);
+  }
+
   function nativeHttp(url, opts) {
     opts = opts || {};
     var plugin = nativePlugin();
-    var headers = opts.headers || BASE_HEADERS;
+    // 必须复制一份：直接改 BASE_HEADERS 会把某个站点的 cookie 污染给后续所有请求
+    var headers = {};
+    var srcHeaders = opts.headers || BASE_HEADERS;
+    for (var hk in srcHeaders) headers[hk] = srcHeaders[hk];
+    // 带上自己维护的会话 cookie（与 cookieStoreSet 写入的共用一份）
+    var jarCookie = jarGet(url);
+    if (jarCookie) headers['Cookie'] = jarCookie;
     if (plugin && typeof plugin.httpRequest === 'function') {
       return plugin.httpRequest({
         url: url,
@@ -95,6 +156,8 @@
         body: opts.body || null,
         binary: !!opts.binary
       }).then(function (res) {
+        // 回传的 cookies 并入 jar，保证下一次请求带上同一个会话
+        if (res && res.cookies) jarSet(url, res.cookies);
         return {
           status: (res && res.status) || 0,
           text: (res && res.body) || '',
@@ -601,6 +664,105 @@
     });
   }
 
+  // ---------- 酷狗扫码登录 ----------
+  // 上游：login-user.kugou.com，web 端签名 = md5(盐 + 参数按 key 排序拼接 + 盐)
+  var KG_APPID = 1005, KG_SRCAPPID = 2919, KG_APIVER = 20, KG_CLIENTVER = 11309;
+  var KG_WEB_SIGN_SALT = 'NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt';
+  var kgQrImgCache = {};
+
+  function kgWebSign(params) {
+    var s = Object.keys(params).map(function (k) { return k + '=' + params[k]; }).sort().join('');
+    return md5Hex(KG_WEB_SIGN_SALT + s + KG_WEB_SIGN_SALT);
+  }
+
+  function kgLoginParams(extra) {
+    var dfid = kgState.dfid || '-';
+    var mid = md5Hex(dfid);
+    var p = {
+      dfid: dfid, mid: mid, uuid: md5Hex(dfid + mid),
+      appid: KG_APPID, apiver: KG_APIVER, clientver: KG_CLIENTVER,
+      userid: kgState.userid || 0, clienttime: Date.now()
+    };
+    Object.keys(extra || {}).forEach(function (k) { p[k] = extra[k]; });
+    p.signature = kgWebSign(p);
+    return p;
+  }
+
+  function kgLoginGet(path, extra) {
+    var p = kgLoginParams(extra);
+    var qs = Object.keys(p).map(function (k) {
+      return encodeURIComponent(k) + '=' + encodeURIComponent(String(p[k]));
+    }).join('&');
+    var headers = {};
+    for (var hk in KG_HEADERS) headers[hk] = KG_HEADERS[hk];
+    headers['dfid'] = p.dfid;
+    headers['mid'] = p.mid;
+    headers['clienttime'] = String(p.clienttime);
+    return nativeHttp('https://login-user.kugou.com' + path + '?' + qs, { headers: headers })
+      .then(function (r) { return JSON.parse(r.text || '{}'); });
+  }
+
+  // 生成二维码 key；上游会直接回一张 base64 二维码图，优先用它（不依赖本地 qrcode 库）
+  function kugouQrKey() {
+    return kgLoginGet('/v2/qrcode', {
+      appid: 1001, type: 1, plat: 4, srcappid: KG_SRCAPPID,
+      qrcode_txt: 'https://h5.kugou.com/apps/loginQRCode/html/index.html?appid=1005&'
+    }).then(function (d) {
+      var data = d.data || {};
+      var key = String(data.qrcode || '');
+      if (!key) throw new Error('酷狗二维码 key 获取失败: ' + JSON.stringify(d).slice(0, 120));
+      if (data.qrcode_img) kgQrImgCache[key] = String(data.qrcode_img);
+      return { key: key, code: 200 };
+    });
+  }
+
+  function kugouQrCreate(key) {
+    var img = kgQrImgCache[key] || '';
+    var content = 'https://h5.kugou.com/apps/loginQRCode/html/index.html?qrcode=' + key;
+    if (!img) {
+      try {
+        if (typeof qrcode === 'function') {
+          var qr = qrcode(0, 'M');
+          qr.addData(content);
+          qr.make();
+          img = qr.createDataURL(6, 12);
+        }
+      } catch (e) { img = ''; }
+    }
+    return Promise.resolve({ img: img, qrurl: content, code: 200 });
+  }
+
+  // 0 过期 / 1 等待扫码 / 2 待确认 / 4 授权成功（带 token、userid）
+  // 同时映射成网易云那套 800/801/802/803，前端无论认哪套都能用
+  function kugouQrCheck(key) {
+    return kgLoginGet('/v2/get_userinfo_qrcode', {
+      plat: 4, appid: KG_APPID, srcappid: KG_SRCAPPID, qrcode: key
+    }).then(function (d) {
+      var data = d.data || {};
+      var st = Number(data.status);
+      var mapped = st === 0 ? 800 : st === 1 ? 801 : st === 2 ? 802 : st === 4 ? 803 : 801;
+      var out = { code: mapped, status: st, loggedIn: false, ok: false };
+      if (st === 4) {
+        var token = String(data.token || '');
+        var userid = String(data.userid || '');
+        kgState.token = token;
+        kgState.userid = userid;
+        if (token) {
+          cookieStoreSet('token=' + token + '; userid=' + userid, '.kugou.com');
+        }
+        delete kgQrImgCache[key];
+        out.loggedIn = true;
+        out.ok = true;
+        out.userId = userid;
+        out.userid = userid;
+        out.nickname = data.nickname || '酷狗用户';
+        out.token = 'set';
+        out.playbackReady = true;
+      }
+      return out;
+    });
+  }
+
   function qqLyric(mid) {
     var url = 'https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid=' + encodeURIComponent(mid) + '&format=json&nobase64=1';
     // 注意：歌词接口要浏览器 UA，QQMusic 客户端 UA 会被拒（返回空）
@@ -803,7 +965,9 @@
       var mid = p.get('mid') || p.get('songmid') || p.get('id') || '';
       var mediaMid = p.get('mediaMid') || p.get('media_mid') || '';
       if (!mid) return Promise.resolve({ provider: 'qq', url: '', playable: false, error: 'MISSING_MID', message: '缺少歌曲 mid' });
-      return qqSongUrl(mid, mediaMid).then(function (r) {
+      // 没带 media_mid 时先解析（只给歌曲 mid 会一律 104003）
+      var urlTask = mediaMid ? qqSongUrl(mid, mediaMid) : qqSongUrlAuto(mid);
+      return urlTask.then(function (r) {
         if (r.url) {
           return {
             provider: 'qq', url: r.url, trial: false, playable: true, playbackReady: true,
@@ -940,6 +1104,20 @@
           message: loggedIn ? '' : 'cookie 里缺少 userid/token（需包含登录后的完整 Cookie）'
         };
       });
+    },
+
+    '/api/kugou/login/qr/key': function () {
+      return kugouQrKey();
+    },
+    '/api/kugou/login/qr/create': function (p) {
+      var key = p.get('key') || '';
+      if (!key) return Promise.resolve({ img: '', qrurl: '', code: 400 });
+      return kugouQrCreate(key);
+    },
+    '/api/kugou/login/qr/check': function (p) {
+      var key = p.get('key') || '';
+      if (!key) return Promise.resolve({ code: 800, status: 0, loggedIn: false });
+      return kugouQrCheck(key);
     },
 
     '/api/kugou/login/status': function () {
@@ -1084,6 +1262,9 @@
     qqSearchSongs: qqSearchSongs,
     kugouSongUrl: kugouSongUrl,
     kugouLyric: kugouLyric,
+    kugouQrKey: kugouQrKey,
+    kugouQrCreate: kugouQrCreate,
+    kugouQrCheck: kugouQrCheck,
     kugouSearchRaw: kugouSearchRaw,
     nat: { UA: UA, QQ_UA: QQ_UA, KG_UA: KG_UA },
     // 原样回传上游响应（代理用）：text 文本或 bytes 二进制
@@ -1102,6 +1283,145 @@
       Object.keys(routes).forEach(function (path) { HANDLERS[path] = routes[path]; });
     }
   };
+
+  // ---------- 移动端画面适配 ----------
+  // 这些 H5 是按桌面/大屏的固定像素排的（720/760/1180px），手机横屏只有 ~430px 高，
+  // 直接铺上去会被裁掉。这里按「内容实际尺寸 vs 视口」等比缩放，保证整屏完整可见且不变形；
+  // 若自动判断不符合口味，左上角 ⛶ 按钮可手动切换档位。
+  var FIT_KEY = 'mr_ios_screen_fit_v1';
+  var FIT_MODES = [
+    { id: 'auto', label: '自动', zoom: 0 },
+    { id: '100', label: '100%', zoom: 1 },
+    { id: '110', label: '110%', zoom: 1.1 },
+    { id: '90', label: '90%', zoom: 0.9 },
+    { id: '80', label: '80%', zoom: 0.8 }
+  ];
+  var fitState = { mode: 'auto', measured: 0 };
+
+  function fitRead() {
+    try { return localStorage.getItem(FIT_KEY) || 'auto'; } catch (e) { return 'auto'; }
+  }
+
+  // 在 zoom=1 的前提下量一次内容真实尺寸，之后缩放不再重复测量
+  function measureContent() {
+    var de = document.documentElement;
+    var b = document.body;
+    var cw = Math.max(de.scrollWidth || 0, (b && b.scrollWidth) || 0);
+    var ch = Math.max(de.scrollHeight || 0, (b && b.scrollHeight) || 0);
+    if (!cw || !ch) return 0;
+    var s = Math.min(window.innerWidth / cw, window.innerHeight / ch);
+    if (s > 1) s = 1;
+    if (s < 0.5) s = 0.5;
+    return Math.round(s * 1000) / 1000;
+  }
+
+  function applyZoom(z) {
+    var de = document.documentElement;
+    if (!z || Math.abs(z - 1) < 0.004) {
+      de.style.zoom = '';
+      return;
+    }
+    de.style.zoom = String(z);
+  }
+
+  function applyFit(mode) {
+    fitState.mode = mode || 'auto';
+    var m = null;
+    for (var i = 0; i < FIT_MODES.length; i++) if (FIT_MODES[i].id === fitState.mode) m = FIT_MODES[i];
+    if (!m) m = FIT_MODES[0];
+    if (m.zoom) { applyZoom(m.zoom); return; }
+    // 自动：先还原再量，避免上一次缩放污染测量结果
+    applyZoom(0);
+    var z = fitState.measured || measureContent();
+    applyZoom(z);
+  }
+
+  function mountFitButton() {
+    if (document.getElementById('mr-fit-btn')) return;
+    var btn = document.createElement('div');
+    btn.id = 'mr-fit-btn';
+    btn.textContent = '⛶';
+    var left = 8;
+    // Folia 的 ⚡ 面板也在左上角，错开
+    if (document.getElementById('folia-perf-btn') || document.querySelector('#mr-perf-btn')) left = 44;
+    var s = btn.style;
+    s.position = 'fixed'; s.top = '8px'; s.left = left + 'px'; s.zIndex = '2147483001';
+    s.width = '30px'; s.height = '30px'; s.lineHeight = '30px'; s.textAlign = 'center';
+    s.fontSize = '16px'; s.borderRadius = '8px'; s.cursor = 'pointer';
+    s.background = 'rgba(20,20,24,.72)'; s.color = '#fff'; s.border = '1px solid rgba(255,255,255,.18)';
+    s.backdropFilter = 'blur(6px)'; s.webkitBackdropFilter = 'blur(6px)';
+    s.userSelect = 'none'; s.webkitUserSelect = 'none';
+    document.body.appendChild(btn);
+
+    var taps = 0, timer = null;
+    btn.addEventListener('click', function () {
+      taps++;
+      clearTimeout(timer);
+      timer = setTimeout(function () {
+        if (taps >= 2) {           // 双击：隐藏按钮（再重载页面恢复）
+          btn.style.display = 'none';
+          try { localStorage.setItem('mr_ios_fit_hidden', '1'); } catch (e) { }
+        } else {                   // 单击：切下一档
+          var ids = FIT_MODES.map(function (m) { return m.id; });
+          var next = ids[(ids.indexOf(fitState.mode) + 1) % ids.length];
+          try { localStorage.setItem(FIT_KEY, next); } catch (e) { }
+          var label = (FIT_MODES.filter(function (m) { return m.id === next; })[0] || {}).label || next;
+          btn.textContent = '⛶';
+          btn.title = '画面：' + label;
+          applyFit(next);
+        }
+        taps = 0;
+      }, 260);
+    });
+  }
+
+  function initScreenFit() {
+    try {
+      // 允许延伸到安全区；缩放范围放宽，配合下面的自动 zoom
+      var vp = document.querySelector('meta[name="viewport"]');
+      if (vp) {
+        vp.setAttribute('content',
+          'width=device-width, initial-scale=1.0, minimum-scale=0.5, maximum-scale=2.0, user-scalable=yes, viewport-fit=cover');
+      }
+      var st = document.createElement('style');
+      st.textContent =
+        'html{-webkit-text-size-adjust:100%;}' +
+        'body{overscroll-behavior:none;}';
+      document.head.appendChild(st);
+    } catch (e) { }
+
+    if (fitRead() === 'auto') fitState.measured = measureContent();
+    applyFit(fitRead());
+
+    // 布局稳定后再量一次（图片/字体加载完尺寸会变）
+    [400, 1200, 3000].forEach(function (t) {
+      setTimeout(function () {
+        if (fitState.mode !== 'auto') return;
+        var z = measureContent();
+        if (z && Math.abs(z - (fitState.measured || 0)) > 0.02) {
+          fitState.measured = z;
+          applyZoom(z);
+        }
+      }, t);
+    });
+
+    var ro = window.addEventListener.bind(window);
+    ro('resize', function () { if (fitState.mode === 'auto') applyFit('auto'); });
+    ro('orientationchange', function () {
+      setTimeout(function () { if (fitState.mode === 'auto') applyFit('auto'); }, 500);
+    });
+
+    try {
+      if (localStorage.getItem('mr_ios_fit_hidden') === '1') return;
+    } catch (e) { }
+    mountFitButton();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initScreenFit);
+  } else {
+    initScreenFit();
+  }
 
   console.log('[Mineradio] standalone bridge ready (ios build)');
 })();

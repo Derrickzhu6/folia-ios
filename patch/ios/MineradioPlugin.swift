@@ -9,6 +9,19 @@ import Capacitor
 @objc(MineradioPlugin)
 public class MineradioPlugin: CAPPlugin {
 
+    // MARK: - 共享会话（扫码登录要靠连续的 Cookie 会话，不能每次新建）
+    // 网易云 /api/login/qrcode/unikey 会 Set-Cookie，后续 /login/qrcode/client/login 必须带上
+    // 同一个会话，否则服务端永远认为「未确认」。复用单例 URLSession + 显式把 Cookie 回传 JS。
+    private static let sharedSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 25
+        config.httpShouldSetCookies = true
+        config.httpCookieAcceptPolicy = .always
+        config.httpCookieStorage = HTTPCookieStorage.shared
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: config)
+    }()
+
     // MARK: - 基础
 
     @objc func echo(_ call: CAPPluginCall) {
@@ -49,14 +62,7 @@ public class MineradioPlugin: CAPPlugin {
             }
         }
 
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 25
-        config.httpShouldSetCookies = true
-        config.httpCookieAcceptPolicy = .always
-        config.httpCookieStorage = HTTPCookieStorage.shared
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-
-        let session = URLSession(configuration: config)
+        let session = MineradioPlugin.sharedSession
         session.dataTask(with: req) { data, response, error in
             if let error = error {
                 call.reject("request failed: \(error.localizedDescription)")
@@ -70,10 +76,15 @@ public class MineradioPlugin: CAPPlugin {
                 }
             }
             let text = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            // 把当前站点已存的 Cookie 回传，JS 侧据此维护自己的 cookie jar，
+            // 下次请求显式带上 —— 这样即使系统 cookie storage 同步有延迟也不会丢会话。
+            let cookieStr = HTTPCookieStorage.shared.cookies(for: url)?.map { "\($0.name)=\($0.value)" }
+                .joined(separator: "; ") ?? ""
             var result: [String: Any] = [
                 "status": http?.statusCode ?? 0,
                 "body": text,
-                "headers": headerMap
+                "headers": headerMap,
+                "cookies": cookieStr
             ]
             if wantsBinary, let data = data {
                 result["bodyBase64"] = data.base64EncodedString()
