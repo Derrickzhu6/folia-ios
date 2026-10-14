@@ -315,82 +315,122 @@ def main():
     log("已打补丁: Info.plist（横屏+竖屏 / ATS / 显示名 Folia / 白色状态栏）")
 
     # ---------- 5b. App 图标 / 启动图 ----------
-    # 优先用仓库内置的确定性图标（本地渲染好的 1024 PNG），不依赖 CI 的 Chrome；
-    # Chrome 渲染只作为「内置图标缺失时」的回退。同时重写 Contents.json 为
-    # 单尺寸 universal 1024（Xcode 13+ 标准）—— 骨架的清单可能指向别的文件名，
-    # 只换图片不换清单的话，实际用的还是骨架默认图标，桌面上就会「没有图标」。
+    # 统一流程：先确定 1024 源图（内置优先，SVG 光栅化兜底），再生成全套尺寸 +
+    # 重写 Contents.json（传统多尺寸格式，actool 最稳）+ 清理骨架遗留文件。
+    # 注意：替换逻辑必须在拿到源图之后统一执行 —— 之前"内置图标分支"直接跳过了
+    # 替换（if ok: 在 SVG 分支内部），导致包里一直是骨架默认图标。
     iconset = os.path.join(app_dir, "Assets.xcassets", "AppIcon.appiconset")
     os.makedirs(iconset, exist_ok=True)
     builtin_icon = os.path.join(PATCH_DIR, "assets", "folia-icon.png")
-    icon_png = os.path.join(iconset, "AppIcon-512@2x.png")
     made = None
     if os.path.isfile(builtin_icon) and os.path.getsize(builtin_icon) > 5000:
         made = builtin_icon
         log("使用内置图标 patch/assets/folia-icon.png")
-    svg_candidates = [
-        os.path.join(folia, "dist", "icon.svg"),
-        os.path.join(folia, "public", "icon.svg"),
-    ]
-    svg = next((p for p in svg_candidates if os.path.isfile(p)), None)
-    if not made and svg:
-        outdir = os.path.join(tmp, "icon")
-        os.makedirs(outdir, exist_ok=True)
-        made = os.path.join(outdir, "icon-1024.png")
-        # 包一层深色底 + 留白，做成规范 App 图标
-        wrapper = os.path.join(outdir, "icon.html")
-        write(wrapper, """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+    if not made:
+        svg_candidates = [
+            os.path.join(folia, "dist", "icon.svg"),
+            os.path.join(folia, "public", "icon.svg"),
+        ]
+        svg = next((p for p in svg_candidates if os.path.isfile(p)), None)
+        if svg:
+            outdir = os.path.join(tmp, "icon")
+            os.makedirs(outdir, exist_ok=True)
+            made = os.path.join(outdir, "icon-1024.png")
+            wrapper = os.path.join(outdir, "icon.html")
+            write(wrapper, """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 html,body{margin:0;padding:0;width:1024px;height:1024px;background:#0b0d10;overflow:hidden}
 .wrap{width:1024px;height:1024px;display:flex;align-items:center;justify-content:center}
 img{width:760px;height:760px}
 </style></head><body><div class="wrap"><img src="%s"></div></body></html>""" % os.path.basename(svg))
-        shutil.copy(svg, os.path.join(outdir, os.path.basename(svg)))
-        ok = False
-        chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        if os.path.exists(chrome):
-            try:
-                subprocess.run([chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
-                                "--hide-scrollbars", "--window-size=1024,1024",
-                                "--screenshot=" + made, "file://" + wrapper],
-                               check=True, capture_output=True, timeout=180)
-                ok = os.path.isfile(made) and os.path.getsize(made) > 5000
-            except Exception as e:
-                log("!! Chrome 光栅化失败: %s" % e)
-        if not ok:
-            try:
-                subprocess.run(["qlmanage", "-t", "-s", "1024", "-o", outdir, svg],
-                               check=True, capture_output=True, timeout=120)
-                alt = os.path.join(outdir, os.path.basename(svg) + ".png")
-                if os.path.isfile(alt) and os.path.getsize(alt) > 5000:
-                    shutil.move(alt, made)
-                    ok = True
-            except Exception as e:
-                log("!! qlmanage 光栅化失败: %s" % e)
-        if ok:
-            # 1) 标准单尺寸位图（Contents.json 会指向它，无论骨架里有没有这个文件名都写一份）
-            shutil.copy(made, icon_png)
-            # 2) 覆盖骨架里可能存在的旧命名，避免残留默认图
-            for fn in ("icon-1024.jpg", "icon1024.png", "AppIcon.png"):
-                p2 = os.path.join(iconset, fn)
-                if os.path.isfile(p2):
-                    shutil.copy(made, p2)
-            # 3) 重写 Contents.json：单尺寸 universal 1024（Xcode 13+ 标准做法）
-            import json as _json
-            with open(os.path.join(iconset, "Contents.json"), "w", encoding="utf-8") as f:
-                _json.dump({
-                    "images": [{"filename": "AppIcon-512@2x.png", "idiom": "universal",
-                                "platform": "ios", "size": "1024x1024"}],
-                    "info": {"author": "xcode", "version": 1}
-                }, f, indent=2)
-            # 4) 启动图
-            for name in ("splash-2732x2732.png", "splash-2732x2732-1.png", "splash-2732x2732-2.png"):
-                sp = os.path.join(app_dir, "Assets.xcassets", "Splash.imageset", name)
-                if os.path.isfile(sp):
-                    shutil.copy(made, sp)
-            log("App 图标/启动图已替换为 Folia（%.1f KB）" % (os.path.getsize(made) / 1024.0))
-        else:
-            must(False, "图标光栅化与内置图标均不可用 —— 这会导致桌面没有图标")
+            shutil.copy(svg, os.path.join(outdir, os.path.basename(svg)))
+            chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            if os.path.exists(chrome):
+                try:
+                    subprocess.run([chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
+                                    "--hide-scrollbars", "--window-size=1024,1024",
+                                    "--screenshot=" + made, "file://" + wrapper],
+                                   check=True, capture_output=True, timeout=180)
+                except Exception as e:
+                    log("!! Chrome 光栅化失败: %s" % e)
+            if not os.path.isfile(made) or os.path.getsize(made) < 5000:
+                try:
+                    subprocess.run(["qlmanage", "-t", "-s", "1024", "-o", outdir, svg],
+                                   check=True, capture_output=True, timeout=120)
+                    alt = os.path.join(outdir, os.path.basename(svg) + ".png")
+                    if os.path.isfile(alt) and os.path.getsize(alt) > 5000:
+                        shutil.move(alt, made)
+                except Exception as e:
+                    log("!! qlmanage 光栅化失败: %s" % e)
+            if not os.path.isfile(made) or os.path.getsize(made) < 5000:
+                made = None
+
+    if made:
+        # 生成全套尺寸（iPhone 60@2x/@3x、iPad 76@2x / 83.5@2x、marketing 1024）。
+        # iOS 的 actool 一直要求 60x60@2x，单尺寸 1024 写法在部分 Xcode 上不被接受
+        # （构建日志警告 "A 60x60@2x app icon is required"，图标产物缺失 → 桌面网格占位）。
+        sizes = {
+            "AppIcon60x60@2x.png": 120,
+            "AppIcon60x60@3x.png": 180,
+            "AppIcon76x76@2x~ipad.png": 152,
+            "AppIcon83.5x83.5@2x~ipad.png": 167,
+            "AppIcon1024.png": 1024,
+        }
+        resized = {}
+        try:
+            from PIL import Image
+            im = Image.open(made)
+            if im.mode != "RGB":
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im.convert("RGBA"), mask=im.convert("RGBA").split()[-1])
+                im = bg
+            for fn, px in sizes.items():
+                out = os.path.join(iconset, fn)
+                im.resize((px, px), Image.LANCZOS).save(out, "PNG")
+                resized[fn] = True
+            log("图标尺寸生成（PIL）: %d 张" % len(resized))
+        except ImportError:
+            # macOS runner 兜底：系统自带 sips
+            for fn, px in sizes.items():
+                out = os.path.join(iconset, fn)
+                try:
+                    subprocess.run(["sips", "-z", str(px), str(px), made, "--out", out],
+                                   check=True, capture_output=True, timeout=60)
+                    resized[fn] = True
+                except Exception as e:
+                    log("!! sips 缩放 %s 失败: %s" % (fn, e))
+            log("图标尺寸生成（sips）: %d 张" % len(resized))
+
+        ok = len(resized) == len(sizes)
+        must(ok, "图标尺寸生成不完整: %s" % sorted(sizes.keys() - resized.keys()))
+
+        # 清理骨架遗留（Contents.json 引用了但不在新清单里，actool 会报 unassigned child）
+        for legacy in ("icon-1024.jpg", "icon1024.png", "AppIcon.png", "AppIcon-512@2x.png"):
+            p2 = os.path.join(iconset, legacy)
+            if os.path.isfile(p2):
+                os.remove(p2)
+
+        import json as _json
+        with open(os.path.join(iconset, "Contents.json"), "w", encoding="utf-8") as f:
+            _json.dump({
+                "images": [
+                    {"filename": "AppIcon60x60@2x.png", "idiom": "iphone", "scale": "2x", "size": "60x60"},
+                    {"filename": "AppIcon60x60@3x.png", "idiom": "iphone", "scale": "3x", "size": "60x60"},
+                    {"filename": "AppIcon76x76@2x~ipad.png", "idiom": "ipad", "scale": "2x", "size": "76x76"},
+                    {"filename": "AppIcon83.5x83.5@2x~ipad.png", "idiom": "ipad", "scale": "2x", "size": "83.5x83.5"},
+                    {"filename": "AppIcon1024.png", "idiom": "ios-marketing", "scale": "1x", "size": "1024x1024"},
+                ],
+                "info": {"author": "xcode", "version": 1}
+            }, f, indent=2)
+
+        # 启动图
+        for name in ("splash-2732x2732.png", "splash-2732x2732-1.png", "splash-2732x2732-2.png"):
+            sp = os.path.join(app_dir, "Assets.xcassets", "Splash.imageset", name)
+            if os.path.isfile(sp):
+                shutil.copy(made, sp)
+        log("App 图标/启动图已替换为 Folia（源图 %.1f KB，%d 个尺寸）"
+            % (os.path.getsize(made) / 1024.0, len(resized)))
     else:
-        log("!! 未找到 Folia 图标 SVG，保留原图标")
+        must(False, "图标源图不可用（内置图标与 SVG 光栅化均失败）—— 桌面会没有图标")
 
     # pbxproj：包名/版本 + 插件入编译
     pbx = os.path.join(ios_dst, "App", "App.xcodeproj", "project.pbxproj")
@@ -454,7 +494,8 @@ img{width:760px;height:760px}
         (os.path.join(bridge_dir, "folia-bridge.js"), "Folia 路由"),
         (os.path.join(app_dir, "MineradioPlugin.swift"), "原生插件"),
         (os.path.join(ios_dst, "App", "App.xcodeproj", "project.pbxproj"), "Xcode 工程"),
-        (os.path.join(ios_dst, "App", "App", "Assets.xcassets", "AppIcon.appiconset", "icon-1024.jpg"), "App 图标"),
+        (os.path.join(ios_dst, "App", "App", "Assets.xcassets", "AppIcon.appiconset", "AppIcon60x60@2x.png"), "App 图标 60@2x"),
+        (os.path.join(ios_dst, "App", "App", "Assets.xcassets", "AppIcon.appiconset", "AppIcon1024.png"), "App 图标 1024"),
         (os.path.join(folia, "capacitor.config.json"), "Capacitor 配置"),
     ]
     for path, name in checks:

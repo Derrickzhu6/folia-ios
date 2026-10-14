@@ -249,6 +249,9 @@
             }
           }
         };
+      }).catch(function (e) {
+        logBridgeErr('ne.status', e);
+        return { code: 200, data: { code: 301, account: null, profile: null } };
       });
     },
 
@@ -262,6 +265,9 @@
     '/neapi/login/qr/key': function () {
       return neQrKey().then(function (key) {
         return { code: 200, data: { code: 200, unikey: key } };
+      }).catch(function (e) {
+        logBridgeErr('ne.key', e);
+        return { code: 502, data: { code: 502, message: String((e && e.message) || e).slice(0, 120) } };
       });
     },
 
@@ -293,6 +299,9 @@
           if (d.cookie) B.cookieStoreSet(d.cookie, '.music.163.com');
         }
         return out;
+      }).catch(function (e) {
+        logBridgeErr('ne.check', e);
+        return { code: 801, message: String((e && e.message) || e).slice(0, 120) };
       });
     },
 
@@ -380,6 +389,7 @@
       return B.kugouQrKey().then(function (r) {
         return { status: 1, data: { qrcode: r.key } };
       }).catch(function (e) {
+        logBridgeErr('kg.key', e);
         return { status: 0, errcode: 502, error: String((e && e.message) || e).slice(0, 120) };
       });
     },
@@ -388,6 +398,9 @@
       if (!key) return Promise.resolve({ status: 0, errcode: 400, error: 'missing key' });
       return B.kugouQrCreate(key).then(function (r) {
         return { status: 1, data: { url: r.qrurl, base64: r.img } };
+      }).catch(function (e) {
+        logBridgeErr('kg.create', e);
+        return { status: 0, errcode: 502, error: String((e && e.message) || e).slice(0, 120) };
       });
     },
     '/kgapi/login/qr/check': function (p) {
@@ -400,6 +413,9 @@
           out.data.userid = r.userid || r.userId || '';
         }
         return out;
+      }).catch(function (e) {
+        logBridgeErr('kg.check', e);
+        return { status: 1, data: { status: 1 } };
       });
     },
     '/kgapi/logout': function () { return Promise.resolve({ status: 1 }); },
@@ -768,6 +784,50 @@
         'canvas{touch-action:none;}';
       document.head.appendChild(style);
     } catch (e) { }
+  })();
+
+  // ================= 登录错误上屏（真机排障） =================
+  // 把桥接层的真实错误显示在 Folia 的「Login Error」旁边，用户截图即可定位问题。
+  function logBridgeErr(tag, e) {
+    try {
+      var arr = [];
+      try { arr = JSON.parse(localStorage.getItem('mr_http_errors') || '[]'); } catch (_) { }
+      arr.push(new Date().toISOString().slice(11, 19) + ' [' + tag + '] ' +
+        String((e && (e.message || e)) || e || 'unknown').slice(0, 150));
+      localStorage.setItem('mr_http_errors', JSON.stringify(arr.slice(-8)));
+    } catch (_) { }
+  }
+
+  (function mountLoginErrorHints() {
+    function lastErr() {
+      try {
+        var a = JSON.parse(localStorage.getItem('mr_http_errors') || '[]');
+        return a.length ? a[a.length - 1] : '';
+      } catch (e) { return ''; }
+    }
+    function scan() {
+      try {
+        var nodes = document.querySelectorAll('div,span,p,h1,h2,h3,h4,h5');
+        for (var i = 0; i < nodes.length; i++) {
+          var el = nodes[i];
+          if (el.children.length) continue;
+          var t = el.textContent || '';
+          if (t.indexOf('Login Error') < 0 && t.indexOf('登录失败') < 0 && t.indexOf('Login failed') < 0) continue;
+          var host = el.parentElement || el;
+          var msg = lastErr();
+          if (!msg) continue;
+          var hint = host.querySelector('.mr-err-hint');
+          if (!hint) {
+            hint = document.createElement('div');
+            hint.className = 'mr-err-hint';
+            hint.style.cssText = 'font-size:11px;line-height:1.4;color:#ff8a8a;margin-top:6px;word-break:break-all;opacity:.9;';
+            host.appendChild(hint);
+          }
+          if (hint.textContent.indexOf(msg) < 0) hint.textContent = '诊断: ' + msg;
+        }
+      } catch (e) { }
+    }
+    setInterval(scan, 1000);
   })();
 
   console.log('[Folia] standalone bridge ready (neapi routes: ' + Object.keys(NE_ROUTES).length + ', profile: ' + activeProfile + ')');

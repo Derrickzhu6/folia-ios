@@ -138,6 +138,34 @@
     jarMerge(jarHostOf(url), cookieStr);
   }
 
+  // 请求失败记录（供登录面板上的「诊断」行显示，定位真机问题用）
+  function recordHttpErr(url, err) {
+    try {
+      var msg = String((err && (err.message || err)) || err || 'unknown');
+      var log = [];
+      try { log = JSON.parse(localStorage.getItem('mr_http_errors') || '[]'); } catch (e) { }
+      log.push(new Date().toISOString().slice(11, 19) + ' ' + String(url).slice(0, 70) + ' | ' + msg.slice(0, 140));
+      localStorage.setItem('mr_http_errors', JSON.stringify(log.slice(-8)));
+    } catch (e) { }
+  }
+
+  // Capacitor 官方 Http 插件（core 内置）：走原生 URLSession，不受 CORS 限制。
+  // 当自定义插件不可用/调用失败时兜底，避免退化到被 WebView CORS 拦死的 fetch。
+  function capHttp(url, opts, headers) {
+    try {
+      var cap = window.Capacitor;
+      var http = cap && ((cap.Plugins && cap.Plugins.CapacitorHttp) || cap.Http);
+      if (!http || typeof http.request !== 'function') return null;
+      var method = (opts.method || 'GET').toUpperCase();
+      var reqOpts = { url: url, method: method, headers: headers || {} };
+      if (opts.body && method !== 'GET' && method !== 'HEAD') reqOpts.data = opts.body;
+      return http.request(reqOpts).then(function (res) {
+        var text = (res && typeof res.data === 'string') ? res.data : JSON.stringify((res && res.data) || '');
+        return { status: (res && res.status) || 0, text: text, headers: (res && res.headers) || {}, base64: '' };
+      });
+    } catch (e) { return null; }
+  }
+
   function nativeHttp(url, opts) {
     opts = opts || {};
     var plugin = nativePlugin();
@@ -164,7 +192,16 @@
           headers: (res && res.headers) || {},
           base64: (res && res.bodyBase64) || ''
         };
+      }).catch(function (err) {
+        recordHttpErr(url, err);
+        var alt = capHttp(url, opts, headers);
+        if (alt) return alt;
+        throw err;
       });
+    }
+    var alt = capHttp(url, opts, headers);
+    if (alt) {
+      return alt.catch(function (err) { recordHttpErr(url, err); throw err; });
     }
     var init = { method: opts.method || 'GET', headers: headers, credentials: 'omit' };
     if (opts.body && init.method !== 'GET') init.body = opts.body;
@@ -184,6 +221,9 @@
       return r.text().then(function (t) {
         return { status: r.status, text: t, headers: hdrs, base64: '' };
       });
+    }).catch(function (err) {
+      recordHttpErr(url, err);
+      throw err;
     });
   }
 
