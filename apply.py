@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 
 FOLIA_ZIP = "https://codeload.github.com/chthollyphile/folia-major/zip/refs/heads/main"
@@ -269,17 +270,31 @@ def main():
     t = t.replace(
         "<key>UIViewControllerBasedStatusBarAppearance</key>\n        <true/>",
         "<key>UIViewControllerBasedStatusBarAppearance</key>\n        <false/>")
+    # 构建号递增：CFBundleVersion 恒为 1 时，部分侧载工具对「同版本覆盖安装」会直接报错
+    t = re.sub(r"<key>CFBundleVersion</key>\s*<string>[^<]*</string>",
+               "<key>CFBundleVersion</key>\n\t<string>" + time.strftime("%Y%m%d%H") + "</string>", t, count=1)
     write(plist, t)
     log("已打补丁: Info.plist（横屏+竖屏 / ATS / 显示名 Folia / 白色状态栏）")
 
-    # ---------- 5b. App 图标 / 启动图：由 Folia 的 icon.svg 光栅化 ----------
-    icon_png = os.path.join(app_dir, "Assets.xcassets", "AppIcon.appiconset", "AppIcon-512@2x.png")
+    # ---------- 5b. App 图标 / 启动图 ----------
+    # 优先用仓库内置的确定性图标（本地渲染好的 1024 PNG），不依赖 CI 的 Chrome；
+    # Chrome 渲染只作为「内置图标缺失时」的回退。同时重写 Contents.json 为
+    # 单尺寸 universal 1024（Xcode 13+ 标准）—— 骨架的清单可能指向别的文件名，
+    # 只换图片不换清单的话，实际用的还是骨架默认图标，桌面上就会「没有图标」。
+    iconset = os.path.join(app_dir, "Assets.xcassets", "AppIcon.appiconset")
+    os.makedirs(iconset, exist_ok=True)
+    builtin_icon = os.path.join(PATCH_DIR, "assets", "folia-icon.png")
+    icon_png = os.path.join(iconset, "AppIcon-512@2x.png")
+    made = None
+    if os.path.isfile(builtin_icon) and os.path.getsize(builtin_icon) > 5000:
+        made = builtin_icon
+        log("使用内置图标 patch/assets/folia-icon.png")
     svg_candidates = [
         os.path.join(folia, "dist", "icon.svg"),
         os.path.join(folia, "public", "icon.svg"),
     ]
     svg = next((p for p in svg_candidates if os.path.isfile(p)), None)
-    if svg:
+    if not made and svg:
         outdir = os.path.join(tmp, "icon")
         os.makedirs(outdir, exist_ok=True)
         made = os.path.join(outdir, "icon-1024.png")
@@ -313,14 +328,29 @@ img{width:760px;height:760px}
             except Exception as e:
                 log("!! qlmanage 光栅化失败: %s" % e)
         if ok:
+            # 1) 标准单尺寸位图（Contents.json 会指向它，无论骨架里有没有这个文件名都写一份）
             shutil.copy(made, icon_png)
+            # 2) 覆盖骨架里可能存在的旧命名，避免残留默认图
+            for fn in ("icon-1024.jpg", "icon1024.png", "AppIcon.png"):
+                p2 = os.path.join(iconset, fn)
+                if os.path.isfile(p2):
+                    shutil.copy(made, p2)
+            # 3) 重写 Contents.json：单尺寸 universal 1024（Xcode 13+ 标准做法）
+            import json as _json
+            with open(os.path.join(iconset, "Contents.json"), "w", encoding="utf-8") as f:
+                _json.dump({
+                    "images": [{"filename": "AppIcon-512@2x.png", "idiom": "universal",
+                                "platform": "ios", "size": "1024x1024"}],
+                    "info": {"author": "xcode", "version": 1}
+                }, f, indent=2)
+            # 4) 启动图
             for name in ("splash-2732x2732.png", "splash-2732x2732-1.png", "splash-2732x2732-2.png"):
                 sp = os.path.join(app_dir, "Assets.xcassets", "Splash.imageset", name)
                 if os.path.isfile(sp):
                     shutil.copy(made, sp)
             log("App 图标/启动图已替换为 Folia（%.1f KB）" % (os.path.getsize(made) / 1024.0))
         else:
-            log("!! 图标光栅化不可用，保留原图标（不影响功能）")
+            must(False, "图标光栅化与内置图标均不可用 —— 这会导致桌面没有图标")
     else:
         log("!! 未找到 Folia 图标 SVG，保留原图标")
 
