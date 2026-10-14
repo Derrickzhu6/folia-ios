@@ -1524,22 +1524,33 @@
 
   function initScreenFit() {
     try {
-      // 关键：不要加 viewport-fit=cover。这些 H5 完全没有 iOS 安全区处理，
-      // 加了 cover 内容就会伸到刘海/灵动岛和底部 Home 条底下被挡住。
-      // 保持默认（auto）让系统自动把视口内缩到安全区，再叠一层 env() 兜底。
+      // viewport-fit=cover：让网页铺满整块屏幕（刘海/Home 条区域由页面自己的背景填充），
+      // 这样顶部不会留出一条与界面异色的空白带 —— 那才是「正常 App」的观感。
+      // 代价是内容会伸到安全区底下，所以下面用 env() 把真正的内容顶开。
       var vp = document.querySelector('meta[name="viewport"]');
       if (vp) {
         vp.setAttribute('content',
-          'width=device-width, initial-scale=1.0, minimum-scale=0.5, maximum-scale=2.0, user-scalable=yes');
+          'width=device-width, initial-scale=1.0, minimum-scale=0.5, maximum-scale=2.0, user-scalable=yes, viewport-fit=cover');
+      } else {
+        var m = document.createElement('meta');
+        m.name = 'viewport';
+        m.content = 'width=device-width, initial-scale=1.0, viewport-fit=cover';
+        document.head.appendChild(m);
       }
       var st = document.createElement('style');
       st.id = 'mr-ios-base';
       st.textContent = [
         'html{-webkit-text-size-adjust:100%;touch-action:manipulation;',
-        /* 兜底：万一 WebView 强制全屏（env() 才有值），就把内容顶开 */
-        'padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px);',
         'background:#0a0a0c;box-sizing:border-box;}',
         'body{overscroll-behavior:none;}',
+        /* 只避让真正会被刘海/Home 条压住的部分，其余区域铺满屏幕：
+           - 全屏容器（fixed inset-0）左右不缩，只在上下留安全区 */
+        '[class*="inset-0"]{padding-top:env(safe-area-inset-top,0px);',
+        'padding-bottom:env(safe-area-inset-bottom,0px);',
+        'padding-left:env(safe-area-inset-left,0px);',
+        'padding-right:env(safe-area-inset-right,0px);}',
+        /* 底部 Home 条：只避让必要的那一条，不额外加高 */
+        '[class*="bottom-0"]{padding-bottom:env(safe-area-inset-bottom,0px);}',
         /* 避免长按歌词/封面弹出系统菜单误触，输入框保留 */
         '*{ -webkit-touch-callout:none; }',
         'input,textarea,select{ -webkit-touch-callout:default; }',

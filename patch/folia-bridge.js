@@ -10,6 +10,17 @@
 (function () {
   'use strict';
 
+  // ---------- 界面语言：默认中文 ----------
+  // Folia 自带 i18n（en / zh-CN / in），但首次启动跟随系统语言，iOS 上常落到英文。
+  // 这里在 app 主脚本执行前把语言偏好写成中文；只强制一次，之后用户在设置里改的语言会保留。
+  try {
+    if (localStorage.getItem('folia_ios_zh_forced') !== '1') {
+      localStorage.setItem('folia_app_language', 'zh-CN');   // Folia 自己的偏好键
+      localStorage.setItem('i18nextLng', 'zh-CN');            // i18next 的检测缓存键
+      localStorage.setItem('folia_ios_zh_forced', '1');
+    }
+  } catch (e) { }
+
   var B = window.__MR_BRIDGE__;
   if (!B) {
     console.warn('[Folia] bridge infra missing (mr-standalone.js 未加载)');

@@ -65,6 +65,41 @@ def must(cond, msg):
         log("!! 校验失败: " + msg)
 
 
+def fix_api_bases(dist):
+    """
+    把构建产物里被写成绝对本地路径的 API 基址校正成同源相对地址。
+    典型（Windows + Git Bash 的 MSYS 路径转换）：
+        VITE_KUGOU_API_BASE:`D:/gongju/.../PortableGit/kgapi`
+    必须变成 `/kgapi`，否则 App 内的桥接路由（/kgapi /neapi /qqapi）收不到任何请求，
+    表现为「扫码登录报错 / 搜索无结果」。
+    """
+    pat = re.compile(
+        r'(?P<q>["\'`])[A-Za-z]:[\\/](?:[^"\'`\n]*?[\\/])?(?P<api>neapi|kgapi|qqapi)(?P=q)')
+    # 顺带处理 http(s)://host/xxx 形态里误带的本地路径段
+    pat2 = re.compile(r'https?://[^"\'`\s]*?/(?P<api>neapi|kgapi|qqapi)(?=["\'`\s])')
+    fixed_files = 0
+    fixed_hits = 0
+    for root, _dirs, files in os.walk(dist):
+        for name in files:
+            if not name.endswith((".js", ".mjs", ".cjs")):
+                continue
+            path = os.path.join(root, name)
+            try:
+                text = open(path, encoding="utf-8", errors="ignore").read()
+            except Exception:
+                continue
+            new = pat.sub(lambda m: m.group("q") + "/" + m.group("api") + m.group("q"), text)
+            new = pat2.sub(lambda m: "/" + m.group("api"), new)
+            if new != text:
+                open(path, "w", encoding="utf-8", newline="").write(new)
+                fixed_files += 1
+                fixed_hits += 1
+    if fixed_hits:
+        log("API 基址已校正为同源相对地址（%d 个文件）" % fixed_files)
+    else:
+        log("API 基址无需校正（已是相对地址）")
+
+
 def download(url, dest):
     log("下载 " + url)
     for attempt in range(3):
@@ -170,7 +205,9 @@ def main():
             "VITE_KUGOU_API_BASE": "/kgapi",
             "VITE_QQ_API_BASE": "/qqapi",
         })
-    dist = os.path.join(folia, "dist")
+    # 构建机若是 Windows + Git Bash，`/neapi` 这类值会被 MSYS 路径转换写成
+    # `D:/xxx/PortableGit/neapi`，App 内根本请求不到 —— 这里校正回同源相对地址。
+    fix_api_bases(dist)
     must(os.path.isdir(dist), "缺少 dist 构建产物")
     must(os.path.isfile(os.path.join(dist, "index.html")), "dist/index.html 不存在")
 
