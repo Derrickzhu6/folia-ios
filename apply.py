@@ -205,6 +205,7 @@ def main():
             "VITE_KUGOU_API_BASE": "/kgapi",
             "VITE_QQ_API_BASE": "/qqapi",
         })
+    dist = os.path.join(folia, "dist")
     # 构建机若是 Windows + Git Bash，`/neapi` 这类值会被 MSYS 路径转换写成
     # `D:/xxx/PortableGit/neapi`，App 内根本请求不到 —— 这里校正回同源相对地址。
     fix_api_bases(dist)
