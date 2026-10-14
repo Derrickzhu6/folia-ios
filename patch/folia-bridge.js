@@ -231,6 +231,7 @@
       return neAccount().then(function (d) {
         var profile = d.profile || null;
         if (!profile || !profile.userId) {
+          logBridgeErr('ne.status', 'account/get 未返回 profile（登录 cookie 可能未生效）');
           return { code: 200, data: { code: 301, account: null, profile: null } };
         }
         return {
@@ -407,6 +408,7 @@
       var key = p.get('key') || p.get('qrcode') || '';
       if (!key) return Promise.resolve({ status: 1, data: { status: 0 } });
       return B.kugouQrCheck(key).then(function (r) {
+        logBridgeErr('kg.check', '轮询返回 status=' + r.status + ' loggedIn=' + !!r.loggedIn);
         var out = { status: 1, data: { status: r.status } };
         if (r.loggedIn) {
           out.data.token = r.token === 'set' ? '' : (r.token || '');
@@ -419,7 +421,28 @@
       });
     },
     '/kgapi/logout': function () { return Promise.resolve({ status: 1 }); },
-    '/kgapi/user/detail': function () { return Promise.resolve({ status: 0, data: null }); },
+    '/kgapi/user/detail': function () {
+      // Folia 扫码确认后会调这里拉账号资料；返回空会让它判定「账号刷新失败」→ 登录错误。
+      // 登录时用户信息已存在 kgState（见 mr-standalone 的 kugouQrCheck），直接返回。
+      var ks = B.kugouState || {};
+      if (!ks.userid) return Promise.resolve({ status: 0, data: null });
+      return Promise.resolve({
+        status: 1,
+        data: {
+          userid: ks.userid,
+          user_id: ks.userid,
+          nickname: ks.nickname || '酷狗用户',
+          username: ks.nickname || '酷狗用户',
+          usertype: 0, vip: 0
+        }
+      });
+    },
+    '/kgapi/user/vip/detail': function () {
+      return Promise.resolve({ status: 1, data: { vip_type: 0, is_vip: 0 } });
+    },
+    '/kgapi/youth/union/vip': function () { return Promise.resolve({ status: 1, data: {} }); },
+    '/kgapi/youth/day/vip': function () { return Promise.resolve({ status: 1, data: {} }); },
+    '/kgapi/youth/day/vip/upgrade': function () { return Promise.resolve({ status: 1, data: {} }); },
     '/kgapi/user/playlist': function () { return Promise.resolve({ status: 1, data: { info: [], total: 0 } }); },
     '/kgapi/playlist/track/all': function () { return Promise.resolve({ status: 1, data: { songs: [], total: 0 } }); },
     '/kgapi/playlist/detail': function () { return Promise.resolve({ status: 0, data: null }); },
@@ -812,7 +835,7 @@
           var el = nodes[i];
           if (el.children.length) continue;
           var t = el.textContent || '';
-          if (t.indexOf('Login Error') < 0 && t.indexOf('登录失败') < 0 && t.indexOf('Login failed') < 0) continue;
+          if (t.indexOf('Login Error') < 0 && t.indexOf('登录错误') < 0 && t.indexOf('登录失败') < 0 && t.indexOf('Login failed') < 0) continue;
           var host = el.parentElement || el;
           var msg = lastErr();
           if (!msg) continue;

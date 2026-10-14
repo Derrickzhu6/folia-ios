@@ -787,6 +787,7 @@
         var userid = String(data.userid || '');
         kgState.token = token;
         kgState.userid = userid;
+        kgState.nickname = data.nickname || '酷狗用户';
         if (token) {
           cookieStoreSet('token=' + token + '; userid=' + userid, '.kugou.com');
         }
@@ -1306,6 +1307,7 @@
     kugouQrCreate: kugouQrCreate,
     kugouQrCheck: kugouQrCheck,
     kugouSearchRaw: kugouSearchRaw,
+    kugouState: kgState,
     nat: { UA: UA, QQ_UA: QQ_UA, KG_UA: KG_UA },
     // 原样回传上游响应（代理用）：text 文本或 bytes 二进制
     rawResponse: function (status, body, contentType, bytes) {
